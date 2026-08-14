@@ -1,0 +1,13 @@
+dataset/cifar10/
+dataset/imagenet/
+dataset/kodak/
+model/
+loss/
+eval/
+predict_pic/
+__pycache__/
+dataset/__pycache__/
+tests/__pycache__/
+*.pt
+*.tmp
+

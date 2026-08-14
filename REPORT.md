@@ -174,6 +174,17 @@ Stable Diffusion VAE、UNet、CLIPの重みはADJSCC checkpointへ重複保存�
 
 `samples/*.png` と `evaluation/*.png` は、上段が原画像、下段が再構成画像のグリッドである。
 
+保存タイミングはepoch境界である。
+
+- `last.pt`: 各epochの学習と、該当する場合は検証が完了した後に毎回上書き保存
+- `best.pt`: `--val-every` ごとの検証lossが過去最良を更新した場合だけ上書き保存
+- `history.json`: 各epoch終了時に追記
+- `samples/epoch_XXXX.png`: 検証を実施したepochで保存
+
+バッチ途中ではcheckpointを保存しない。このため、学習を中断した場合は現在処理中のepochが失われ、`last.pt` に記録された最後の完了epochから再開する。第1 epochの途中で中断した場合は、まだ `last.pt` も `best.pt` も存在しない。
+
+`--log-every 100` は学習・検証・独立評価の進捗を100バッチごとに表示する。学習lossは直近100バッチの平均、検証指標はその時点までの累積値である。経過時間と現在までの平均速度から計算したETAも表示する。最後のバッチは指定間隔と一致しなくても表示され、`--log-every 0` で進捗表示を無効化できる。
+
 ## 8. フルコマンド
 
 すべてリポジトリrootから実行する。
@@ -187,7 +198,7 @@ conda activate ldm
 
 ### 8.2 第1段階: 潜在MSEのみ
 
-以下はFFHQ 69,000枚を学習、1,000枚を検証し、512px、SNR 0～20 dBで100 epoch学習するフルコマンドである。`batch-size=1` と `accumulation-steps=8` により実効batch sizeを8にする。
+以下はFFHQ 69,000枚を学習、1,000枚を検証し、256px、SNR -10～20 dBで100 epoch学習するフルコマンドである。`batch-size=1` と `accumulation-steps=8` により実効batch sizeを8にする。
 
 ```bash
 python ADJSCC/adjscc_sd_vae_ffhq.py train \
@@ -212,6 +223,7 @@ python ADJSCC/adjscc_sd_vae_ffhq.py train \
   --accumulation-steps 8 \
   --grad-clip 1.0 \
   --val-every 1 \
+  --log-every 100 \
   --num-workers 4 \
   --sample-count 4 \
   --device cuda
@@ -227,7 +239,7 @@ python ADJSCC/adjscc_sd_vae_ffhq.py train \
   --sd-config configs/stable-diffusion/v1-inference.yaml \
   --sd-checkpoint models/ldm/stable-diffusion-v1/model.ckpt \
   --output-dir ADJSCC/outputs/sd_vae_ffhq_stage2 \
-  --image-size 512 \
+  --image-size 256 \
   --val-count 1000 \
   --split-seed 0 \
   --transmit-channel-num 16 \
@@ -244,6 +256,7 @@ python ADJSCC/adjscc_sd_vae_ffhq.py train \
   --accumulation-steps 8 \
   --grad-clip 1.0 \
   --val-every 1 \
+  --log-every 100 \
   --num-workers 4 \
   --sample-count 4 \
   --resume ADJSCC/outputs/sd_vae_ffhq_stage1/best.pt \
@@ -262,7 +275,7 @@ python ADJSCC/adjscc_sd_vae_ffhq.py train \
   --sd-config configs/stable-diffusion/v1-inference.yaml \
   --sd-checkpoint models/ldm/stable-diffusion-v1/model.ckpt \
   --output-dir ADJSCC/outputs/sd_vae_ffhq_stage2 \
-  --image-size 512 \
+  --image-size 256 \
   --val-count 1000 \
   --split-seed 0 \
   --transmit-channel-num 16 \
@@ -279,6 +292,7 @@ python ADJSCC/adjscc_sd_vae_ffhq.py train \
   --accumulation-steps 8 \
   --grad-clip 1.0 \
   --val-every 1 \
+  --log-every 100 \
   --num-workers 4 \
   --sample-count 4 \
   --resume ADJSCC/outputs/sd_vae_ffhq_stage2/last.pt \
@@ -296,7 +310,7 @@ python ADJSCC/adjscc_sd_vae_ffhq.py eval \
   --sd-checkpoint models/ldm/stable-diffusion-v1/model.ckpt \
   --output-dir ADJSCC/outputs/sd_vae_ffhq_stage2 \
   --checkpoint ADJSCC/outputs/sd_vae_ffhq_stage2/best.pt \
-  --image-size 512 \
+  --image-size 256 \
   --val-count 1000 \
   --split-seed 0 \
   --transmit-channel-num 16 \
@@ -306,6 +320,7 @@ python ADJSCC/adjscc_sd_vae_ffhq.py eval \
   --latent-loss-weight 1.0 \
   --image-loss-weight 0.1 \
   --eval-batch-size 1 \
+  --log-every 100 \
   --num-workers 4 \
   --sample-count 4 \
   --device cuda
@@ -338,6 +353,7 @@ python ADJSCC/adjscc_sd_vae_ffhq.py train \
   --sample-count 1 \
   --max-train-batches 1 \
   --max-eval-batches 1 \
+  --log-every 1 \
   --device cpu
 ```
 
@@ -361,16 +377,17 @@ python ADJSCC/adjscc_sd_vae_ffhq.py train \
 3. 4チャネルLatent ADJSCCのforward/backward
 4. 17×19の非4倍潜在に対するshape復元
 5. FFHQ 70,000枚の検出と69,000/1,000分割
-6. FFHQ画像の512×512化と `[-1,1]` 正規化
+6. FFHQ画像の指定解像度化と `[-1,1]` 正規化
 7. 指定 `model.ckpt` からfirst-stage VAEだけを抽出
 8. VAE encode/decode shape確認
 9. 凍結VAE Decoderを介した `z_hat` 勾配確認
 10. 潜在MSEのみの1 batch学習、検証、best/last保存
 11. 第1段階checkpointから画像L1付きfine-tuning
 12. 独立evalコマンドによるJSON、PNG出力
-13. ADJSCC単体テスト9件
+13. `--log-every` の指定間隔・最終バッチ進捗表示
+14. ADJSCC単体テスト10件
 
-単体テスト結果は9件すべて成功した。
+単体テスト結果は10件すべて成功した。
 
 CPUスモークテストは32px、学習・検証各1枚なので、出力値は品質を表さない。経路確認時の例は次のとおり。
 
@@ -381,7 +398,7 @@ CPUスモークテストは32px、学習・検証各1枚なので、出力値は
 
 ## 11. 注意事項
 
-- 70,000枚・512pxの本学習は実行していない。実装検証はCPUの最小構成で行った。
+- 70,000枚を使う本学習は実行していない。実装検証はCPUの最小構成で行った。
 - 512pxで画像L1を使う第2段階は、凍結VAE Decoderのbackwardが必要なので第1段階よりVRAM使用量が大きい。
 - CUDA OOM時は `batch-size` を1のまま保ち、`accumulation-steps` を増やす。必要なら `feature-channels` を下げるが、別アーキテクチャになるためcheckpoint互換性はなくなる。
 - 本実装はPyTorch 1.11互換のfloat32処理を使用し、AMPは導入していない。
