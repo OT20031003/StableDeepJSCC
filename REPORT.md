@@ -213,11 +213,11 @@ python ADJSCC/adjscc_sd_vae_ffhq.py train \
   --data-dir ../datasets/ffhq_train_70k \
   --sd-config configs/stable-diffusion/v1-inference.yaml \
   --sd-checkpoint models/ldm/stable-diffusion-v1/model.ckpt \
-  --output-dir ADJSCC/outputs/sd_vae_ffhq_stage1 \
+  --output-dir ADJSCC/outputs/sd_vae_ffhq_stage1_C32 \
   --image-size 256 \
   --val-count 1000 \
   --split-seed 0 \
-  --transmit-channel-num 16 \
+  --transmit-channel-num 32 \
   --feature-channels 256 \
   --snr-low-train -10 \
   --snr-up-train 20 \
