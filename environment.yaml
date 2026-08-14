@@ -11,7 +11,8 @@ dependencies:
   - numpy=1.19.2
   - pip:
     - albumentations==0.4.3
-    - diffusers
+    - diffusers==0.2.4
+    - huggingface-hub==0.25.2
     - opencv-python==4.1.2.30
     - pudb==2019.2
     - invisible-watermark
@@ -23,7 +24,7 @@ dependencies:
     - streamlit>=0.73.1
     - einops==0.3.0
     - torch-fidelity==0.3.0
-    - transformers==4.19.2
+    - transformers==4.24.0
     - torchmetrics==0.6.0
     - kornia==0.6
     - -e git+https://github.com/CompVis/taming-transformers.git@master#egg=taming-transformers
