@@ -7,7 +7,9 @@ FFHQ画像をStable DiffusionのVAE潜在空間へ写像し、その4チャネ�
 新規実装ファイルは次のとおり。
 
 - `ADJSCC/adjscc_sd_vae_ffhq.py`
+- `ADJSCC/adjscc_sd_img2img.py`
 - 追加テスト: `ADJSCC/tests/test_pytorch_port.py`
+- 追加テスト: `ADJSCC/tests/test_sd_adjscc_img2img.py`
 
 既存の画像空間用 `DeepJSCC` は3チャネル入力かつSigmoid出力であるため使用していない。既存実装から次の部品だけを再利用した。
 
@@ -37,7 +39,7 @@ z_hat: [B, 4, 64, 64]
 x_hat: [B, 3, 512, 512]
 ```
 
-Stable DiffusionのUNetとCLIPテキストEncoderは使用しない。`models/ldm/stable-diffusion-v1/model.ckpt` からキーが `first_stage_model.` で始まるVAE重みだけを抽出してロードする。
+ADJSCCの学習・単独評価時にはStable DiffusionのUNetとCLIPテキストEncoderは使用しない。`models/ldm/stable-diffusion-v1/model.ckpt` からキーが `first_stage_model.` で始まるVAE重みだけを抽出してロードする。後述するStable Diffusion付き推論では、同じcheckpointからUNet・CLIP・VAEを含むfull modelをロードする。
 
 設定ファイルは `configs/stable-diffusion/v1-inference.yaml` を使用し、同設定の `scale_factor=0.18215` を適用する。
 
@@ -396,9 +398,11 @@ python ADJSCC/adjscc_sd_vae_ffhq.py train \
 12. 独立evalコマンドによるJSON、PNG出力
 13. `--log-every` の指定間隔・最終バッチ進捗表示
 14. 割合指定checkpointがOptimizer step直後だけで発火すること
-15. ADJSCC単体テスト11件
+15. Stable Diffusion付き推論のstrength境界、入力前処理、checkpoint metadata読込
+16. 実full Stable Diffusion・実ADJSCC checkpointによるGPU推論
+17. 全単体テスト15件
 
-単体テスト結果は11件すべて成功した。
+単体テスト結果は15件すべて成功した。
 
 CPUスモークテストは32px、学習・検証各1枚なので、出力値は品質を表さない。経路確認時の例は次のとおり。
 
@@ -407,7 +411,147 @@ CPUスモークテストは32px、学習・検証各1枚なので、出力値は
 - 第2段階 train image L1: 0.45075285
 - 10 dB評価 image PSNR: 13.9392 dB
 
-## 11. 注意事項
+Stable Diffusion付きGPUスモークテストでは、64px入力、SNR 0 dB、`ddim_steps=2`、`strength=0.5` とし、次の全経路を確認した。
+
+```text
+実FFHQ画像 → full SD VAE Encoder → 実ADJSCC → AWGN
+→ 実ADJSCC Decoder → CLIP conditioning → DDIM UNet 1 step
+→ full SD VAE Decoder → PNG・JSON保存
+```
+
+## 11. Stable Diffusion付きADJSCC img2img推論
+
+### 11.1 実装ファイルと処理系列
+
+新規推論CLIは次のファイルである。
+
+```text
+ADJSCC/adjscc_sd_img2img.py
+```
+
+処理系列は次のとおり。
+
+```text
+入力画像 x: [1, 3, 256, 256], 値域 [-1, 1]
+    ↓ Stable Diffusion VAE Encoder
+初期潜在 z: [1, 4, 32, 32]
+    ↓ 学習済みLatent ADJSCC Encoder
+通信表現 y: [1, 16, 8, 8]
+    ↓ 電力正規化
+    ↓ AWGN（--snr-db）
+受信表現 y_hat
+    ↓ 学習済みLatent ADJSCC Decoder
+受信潜在 z_hat: [1, 4, 32, 32]
+    ↓ DDIM stochastic_encode（--strength）
+拡散ノイズ付き潜在 z_t
+    ↓ Stable Diffusion UNet + prompt conditioning
+精製潜在 z_sd
+    ↓ Stable Diffusion VAE Decoder
+最終画像 x_sd: [N, 3, 256, 256]
+```
+
+学習CLIと異なり、この推論CLIは `models/ldm/stable-diffusion-v1/model.ckpt` からVAE、UNet、CLIP text Encoderを含むfull Stable Diffusion modelをロードする。Stable DiffusionとADJSCCの全パラメータをeval・freezeし、推論全体を `torch.no_grad()` で実行する。
+
+入力は中央正方形crop後に `--image-size` へLanczos resizeし、`[-1,1]` に変換する。ADJSCC checkpoint内metadataから `transmit_channel_num` と `feature_channels` を自動取得する。途中保存checkpointを指定した場合は、処理中epochと進捗率を警告表示し、`metadata.json`にも記録する。
+
+### 11.2 strengthと2種類のノイズ
+
+本パイプラインには独立した2種類のノイズがある。
+
+| 引数 | 対象 | 意味 |
+|---|---|---|
+| `--snr-db` | 通信路AWGN | 小さいほど通信ノイズが強い |
+| `--strength` | Stable Diffusion img2img | 大きいほど `z_hat` に強い拡散ノイズを加え、入力構造を変更しやすい |
+
+`scripts/img2img.py` と同じ考え方で、DDIM逆拡散step数を次のように決める。
+
+```python
+t_enc = int(strength * ddim_steps)
+```
+
+- `strength=0`: 拡散ノイズとUNet逆拡散を省略し、ADJSCC受信潜在をそのままVAE復号
+- `0 < strength < 1`: `t_enc` stepだけノイズ付加・逆拡散
+- `strength=1`: 全DDIM stepを使用し、入力潜在の情報を最も強く崩す
+
+元の `img2img.py` は `strength=1` のとき配列末尾を越える可能性があるため、新規実装ではノイズ付加indexを `t_enc-1` とする。これにより0～1の全範囲を有効にし、逆拡散step数とも整合させた。`strength`の実効分解能は `1/ddim_steps` である。
+
+複数の `--num-samples` を指定した場合、ADJSCC/AWGNは入力画像に対して1回だけ実行する。その同じ `z_hat` を複製し、サンプルごとに異なるStable Diffusion拡散ノイズを加える。このため、複数出力間の差は通信路ではなくStable Diffusion側の確率性による。
+
+主要な生成引数は次のとおり。
+
+| 引数 | デフォルト | 用途 |
+|---|---:|---|
+| `--strength` | 0.35 | img2img拡散ノイズ量、0～1 |
+| `--snr-db` | 0 | ADJSCCのAWGN SNR |
+| `--ddim-steps` | 50 | DDIM schedule総step数 |
+| `--ddim-eta` | 0 | DDIM samplingの追加確率性 |
+| `--guidance-scale` | 5 | promptへのClassifier-Free Guidance強度。1ならCFGなし |
+| `--num-samples` | 4 | 同じ通信結果から生成する画像数 |
+| `--seed` | 42 | VAE posterior、AWGN、拡散ノイズの乱数seed |
+
+### 11.3 フル推論コマンド
+
+次は256px画像をSNR -5 dBで伝送し、`strength=0.35`でStable Diffusion img2img処理を行い、4枚生成するフルコマンドである。
+
+```bash
+cd /mnt/d/stable-diffusion
+conda activate ldm
+
+python ADJSCC/adjscc_sd_img2img.py \
+  --init-img ../datasets/ffhq_train_70k/00000.png \
+  --prompt "" \
+  --negative-prompt "" \
+  --output-dir ADJSCC/outputs/sd_adjscc_img2img/snr_20_strength_035 \
+  --adjscc-checkpoint ADJSCC/outputs/sd_vae_ffhq_stage2/last.pt \
+  --sd-config configs/stable-diffusion/v1-inference.yaml \
+  --sd-checkpoint models/ldm/stable-diffusion-v1/model.ckpt \
+  --image-size 256 \
+  --snr-db 20 \
+  --strength 0.75 \
+  --ddim-steps 50 \
+  --ddim-eta 0.0 \
+  --guidance-scale 5.0 \
+  --num-samples 4 \
+  --seed 42 \
+  --precision autocast \
+  --device cuda
+```
+
+品質比較では同じ `--seed`、`--snr-db`、promptを保ち、`--strength` と出力ディレクトリだけを変更する。epoch完了後の最良モデルが存在する場合は、`last.pt`の代わりに `best.pt`を推奨する。
+
+### 11.4 保存結果
+
+指定した `--output-dir` には次を保存する。
+
+```text
+output_dir/
+├── input.png
+├── adjscc_received.png
+├── sample_000.png
+├── sample_001.png
+├── sample_002.png
+├── sample_003.png
+├── comparison_grid.png
+└── metadata.json
+```
+
+- `input.png`: 前処理済み入力画像
+- `adjscc_received.png`: Stable Diffusion処理前の `z_hat` をVAE復号した通信結果
+- `sample_XXX.png`: Stable Diffusion処理後の最終画像
+- `comparison_grid.png`: 上段が入力、中段がADJSCC受信再構成、下段が最終画像
+- `metadata.json`: prompt、SNR、strength、seed、checkpoint情報、潜在shape、実DDIM step数、全出力名
+
+出力ファイル名は同一ディレクトリでは上書きされるため、SNRやstrengthごとに異なる `--output-dir` を指定する。
+
+### 11.5 推論時の注意
+
+- full Stable Diffusion、ADJSCC、生成batchを同時にGPUへ置く。CUDA OOM時は最初に `--num-samples 1`へ下げる。
+- `--precision autocast`はCUDA時のみ有効で、CPUでは自動的にfull precisionとなる。
+- `--guidance-scale 1`ではnegative promptを使用せず、UNetのbatch倍増も起きない。
+- `strength=0`ではprompt conditioningとUNetを実行しないため、promptは出力に影響しない。
+- safety checkerやwatermarkは追加していない。
+
+## 12. 注意事項
 
 - 70,000枚を使う本学習は実行していない。実装検証はCPUの最小構成で行った。
 - 512pxで画像L1を使う第2段階は、凍結VAE Decoderのbackwardが必要なので第1段階よりVRAM使用量が大きい。
