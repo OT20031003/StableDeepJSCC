@@ -169,19 +169,25 @@ output_dir/
 - epoch
 - best validation loss
 - 実行引数metadata
+- checkpoint種別と、途中保存時のbatch数・進捗率
 
 Stable Diffusion VAE、UNet、CLIPの重みはADJSCC checkpointへ重複保存しない。
 
 `samples/*.png` と `evaluation/*.png` は、上段が原画像、下段が再構成画像のグリッドである。
 
-保存タイミングはepoch境界である。
+通常の保存タイミングと割合指定保存は次のとおり。
 
 - `last.pt`: 各epochの学習と、該当する場合は検証が完了した後に毎回上書き保存
+- `last.pt`（途中保存）: `--save-every-percent N` を指定すると、各epochの約N%、2N%…でも同じファイルへ上書き保存
 - `best.pt`: `--val-every` ごとの検証lossが過去最良を更新した場合だけ上書き保存
 - `history.json`: 各epoch終了時に追記
 - `samples/epoch_XXXX.png`: 検証を実施したepochで保存
 
-バッチ途中ではcheckpointを保存しない。このため、学習を中断した場合は現在処理中のepochが失われ、`last.pt` に記録された最後の完了epochから再開する。第1 epochの途中で中断した場合は、まだ `last.pt` も `best.pt` も存在しない。
+`--save-every-percent` は0より大きく100以下の値を受け付け、デフォルトの`0`では従来どおりepoch終了時だけ保存する。例えば`--save-every-percent 10`では、10%、20%…90%付近と、通常のepoch終了時に保存する。100%時点は検証後の通常保存が担当する。途中checkpointを世代別に増やさず`last.pt`へ原子的に上書きするため、保存回数を増やしてもディスク使用量は増え続けない。
+
+gradient accumulation中の未反映勾配はcheckpointに含まれないため、割合閾値を超えた後の最初のOptimizer step直後に保存する。したがって、`--accumulation-steps 8`では指定率より最大7バッチ遅れる場合がある。保存時には実際のbatch数と進捗率を表示する。
+
+途中保存された`last.pt`には、完全に終了したepoch数とは別に、処理中epoch・batch数・進捗率を記録する。`--resume`でこのcheckpointを指定すると処理中だったepochを先頭からやり直す。バッチ位置からの厳密再開ではないが、途中まで学習したADJSCC重みとOptimizer状態は復元され、処理中epochを誤って完了扱いして飛ばすことはない。epoch終了後の`last.pt`からは従来どおり次epochへ進む。
 
 `--log-every 100` は学習・検証・独立評価の進捗を100バッチごとに表示する。学習lossは直近100バッチの平均、検証指標はその時点までの累積値である。経過時間と現在までの平均速度から計算したETAも表示する。最後のバッチは指定間隔と一致しなくても表示され、`--log-every 0` で進捗表示を無効化できる。
 
@@ -224,6 +230,7 @@ python ADJSCC/adjscc_sd_vae_ffhq.py train \
   --grad-clip 1.0 \
   --val-every 1 \
   --log-every 100 \
+  --save-every-percent 10 \
   --num-workers 4 \
   --sample-count 4 \
   --device cuda
@@ -244,11 +251,11 @@ python ADJSCC/adjscc_sd_vae_ffhq.py train \
   --split-seed 0 \
   --transmit-channel-num 16 \
   --feature-channels 256 \
-  --snr-low-train 0 \
+  --snr-low-train -10 \
   --snr-up-train 20 \
-  --snr-val 10 \
-  --latent-loss-weight 1.0 \
-  --image-loss-weight 0.1 \
+  --snr-val -5 \
+  --latent-loss-weight 0.5 \
+  --image-loss-weight 0.5 \
   --learning-rate 0.00005 \
   --epochs 50 \
   --batch-size 1 \
@@ -257,6 +264,7 @@ python ADJSCC/adjscc_sd_vae_ffhq.py train \
   --grad-clip 1.0 \
   --val-every 1 \
   --log-every 100 \
+  --save-every-percent 10 \
   --num-workers 4 \
   --sample-count 4 \
   --resume ADJSCC/outputs/sd_vae_ffhq_stage1/best.pt \
@@ -267,7 +275,7 @@ python ADJSCC/adjscc_sd_vae_ffhq.py train \
 
 ### 8.4 中断した同一段階の学習再開
 
-Optimizerとbest値も復元するため、`--reset-optimizer` と `--reset-best` は付けない。`--epochs 20` は保存epochからさらに20 epoch実行する意味である。
+Optimizerとbest値も復元するため、`--reset-optimizer` と `--reset-best` は付けない。epoch終了checkpointの場合、`--epochs 20` は保存epochからさらに20 epoch実行する意味である。途中保存checkpointの場合は処理中だったepochを先頭から再実行し、そこから20 epoch実行する。
 
 ```bash
 python ADJSCC/adjscc_sd_vae_ffhq.py train \
@@ -280,7 +288,7 @@ python ADJSCC/adjscc_sd_vae_ffhq.py train \
   --split-seed 0 \
   --transmit-channel-num 16 \
   --feature-channels 256 \
-  --snr-low-train 0 \
+  --snr-low-train -10 \
   --snr-up-train 20 \
   --snr-val 10 \
   --latent-loss-weight 1.0 \
@@ -293,6 +301,7 @@ python ADJSCC/adjscc_sd_vae_ffhq.py train \
   --grad-clip 1.0 \
   --val-every 1 \
   --log-every 100 \
+  --save-every-percent 10 \
   --num-workers 4 \
   --sample-count 4 \
   --resume ADJSCC/outputs/sd_vae_ffhq_stage2/last.pt \
@@ -309,17 +318,17 @@ python ADJSCC/adjscc_sd_vae_ffhq.py eval \
   --sd-config configs/stable-diffusion/v1-inference.yaml \
   --sd-checkpoint models/ldm/stable-diffusion-v1/model.ckpt \
   --output-dir ADJSCC/outputs/sd_vae_ffhq_stage2 \
-  --checkpoint ADJSCC/outputs/sd_vae_ffhq_stage2/best.pt \
+  --checkpoint ADJSCC/outputs/sd_vae_ffhq_stage2/last.pt \
   --image-size 256 \
-  --val-count 1000 \
+  --val-count 100 \
   --split-seed 0 \
   --transmit-channel-num 16 \
   --feature-channels 256 \
-  --eval-snrs 0 5 10 15 20 \
-  --eval-repeats 10 \
+  --eval-snrs -10 -5 0 5 10 15 20 \
+  --eval-repeats 1 \
   --latent-loss-weight 1.0 \
   --image-loss-weight 0.1 \
-  --eval-batch-size 1 \
+  --eval-batch-size 4 \
   --log-every 100 \
   --num-workers 4 \
   --sample-count 4 \
@@ -354,6 +363,7 @@ python ADJSCC/adjscc_sd_vae_ffhq.py train \
   --max-train-batches 1 \
   --max-eval-batches 1 \
   --log-every 1 \
+  --save-every-percent 10 \
   --device cpu
 ```
 
@@ -385,9 +395,10 @@ python ADJSCC/adjscc_sd_vae_ffhq.py train \
 11. 第1段階checkpointから画像L1付きfine-tuning
 12. 独立evalコマンドによるJSON、PNG出力
 13. `--log-every` の指定間隔・最終バッチ進捗表示
-14. ADJSCC単体テスト10件
+14. 割合指定checkpointがOptimizer step直後だけで発火すること
+15. ADJSCC単体テスト11件
 
-単体テスト結果は10件すべて成功した。
+単体テスト結果は11件すべて成功した。
 
 CPUスモークテストは32px、学習・検証各1枚なので、出力値は品質を表さない。経路確認時の例は次のとおり。
 

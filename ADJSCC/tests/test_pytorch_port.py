@@ -186,7 +186,49 @@ class ModelTests(unittest.TestCase):
         self.assertIn("Epoch 7 train [2/3", progress)
         self.assertIn("Epoch 7 train [3/3 (100.00%)]", progress)
         self.assertIn("ETA=", progress)
-        self.assertEqual(build_parser().parse_args(["train"]).log_every, 100)
+        defaults = build_parser().parse_args(["train"])
+        self.assertEqual(defaults.log_every, 100)
+        self.assertEqual(defaults.save_every_percent, 0.0)
+
+    def test_percentage_checkpoint_schedule_waits_for_optimizer_step(self):
+        class DummyADJSCC(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.scale = torch.nn.Parameter(torch.tensor(0.5))
+
+            def forward(self, latent, snr_db):
+                del snr_db
+                return self.scale * latent
+
+        class DummyVAE(torch.nn.Module):
+            def encode(self, images):
+                return torch.cat((images, images[:, :1]), dim=1)
+
+        model = DummyADJSCC()
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        loader = [
+            {"image": torch.randn(1, 3, 8, 8)} for _ in range(10)
+        ]
+        checkpoints = []
+        train_one_epoch(
+            model,
+            DummyVAE(),
+            loader,
+            optimizer,
+            torch.device("cpu"),
+            snr_low=0.0,
+            snr_high=0.0,
+            latent_weight=1.0,
+            image_weight=0.0,
+            accumulation_steps=3,
+            save_every_percent=25.0,
+            checkpoint_callback=lambda batch, total, percent: checkpoints.append(
+                (batch, total, percent)
+            ),
+        )
+        self.assertEqual([item[0] for item in checkpoints], [3, 6, 9])
+        self.assertEqual([item[1] for item in checkpoints], [10, 10, 10])
+        self.assertEqual([item[2] for item in checkpoints], [30.0, 60.0, 90.0])
 
 
 class DatasetTests(unittest.TestCase):

@@ -8,7 +8,7 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -429,6 +429,8 @@ def train_one_epoch(
     max_batches: Optional[int] = None,
     epoch: int = 1,
     log_every: int = 0,
+    save_every_percent: float = 0.0,
+    checkpoint_callback: Optional[Callable[[int, int, float], None]] = None,
 ) -> Dict[str, float]:
     adjscc.train()
     vae.eval()
@@ -440,6 +442,24 @@ def train_one_epoch(
     interval_samples = 0
     total_batches = _effective_batch_count(loader, max_batches)
     started_at = time.monotonic()
+    next_checkpoint_percent = (
+        save_every_percent if save_every_percent > 0 else None
+    )
+
+    def maybe_save_progress(processed_batches: int) -> None:
+        nonlocal next_checkpoint_percent
+        if checkpoint_callback is None or next_checkpoint_percent is None:
+            return
+        # The normal epoch-end checkpoint covers 100% after validation. Keeping
+        # intra-epoch saves below 100% avoids a redundant large write.
+        if processed_batches >= total_batches:
+            return
+        percentage = 100.0 * processed_batches / max(total_batches, 1)
+        if percentage + 1e-9 < next_checkpoint_percent:
+            return
+        checkpoint_callback(processed_batches, total_batches, percentage)
+        while next_checkpoint_percent <= percentage + 1e-9:
+            next_checkpoint_percent += save_every_percent
 
     for batch_index, batch in enumerate(loader):
         if max_batches is not None and batch_index >= max_batches:
@@ -475,9 +495,11 @@ def train_one_epoch(
             interval_totals[name] += value * batch_size
         interval_samples += batch_size
 
+        optimizer_stepped = False
         if accumulated == accumulation_steps:
             _optimizer_step(adjscc, optimizer, accumulated, grad_clip)
             accumulated = 0
+            optimizer_stepped = True
 
         processed_batches = batch_index + 1
         if _should_log_progress(processed_batches, total_batches, log_every):
@@ -507,6 +529,11 @@ def train_one_epoch(
             )
             interval_totals = {name: 0.0 for name in totals}
             interval_samples = 0
+
+        # Optimizer gradients are not part of state_dict. Save only immediately
+        # after an optimizer step so every processed gradient is represented.
+        if optimizer_stepped:
+            maybe_save_progress(processed_batches)
 
     if accumulated:
         _optimizer_step(adjscc, optimizer, accumulated, grad_clip)
@@ -736,9 +763,27 @@ def train_command(args, device: torch.device) -> None:
         start_epoch = int(payload.get("epoch", 0))
         if not args.reset_best:
             best_loss = float(payload.get("best_loss", best_loss))
+        resume_metadata = payload.get("metadata", {})
         for group in optimizer.param_groups:
             group["lr"] = args.learning_rate
-        print("resumed ADJSCC from epoch {}".format(start_epoch))
+        if resume_metadata.get("checkpoint_kind") == "intra_epoch":
+            print(
+                (
+                    "resumed intra-epoch ADJSCC checkpoint from epoch {} "
+                    "at batch {}/{} ({:.2f}%); epoch {} will restart "
+                    "from its beginning"
+                ).format(
+                    resume_metadata.get("epoch_in_progress", start_epoch + 1),
+                    resume_metadata.get("batch_in_epoch", "?"),
+                    resume_metadata.get("batches_in_epoch", "?"),
+                    float(resume_metadata.get("progress_percent", 0.0)),
+                    start_epoch + 1,
+                )
+            )
+        else:
+            print("resumed ADJSCC from epoch {}".format(start_epoch))
+        del payload
+        gc.collect()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -747,6 +792,7 @@ def train_command(args, device: torch.device) -> None:
     metadata = dict(vars(args))
     metadata["transmit_channel_num"] = transmit_channels
     metadata["feature_channels"] = feature_channels
+    last_checkpoint_path = output_dir / "last.pt"
 
     print("device: {}".format(device))
     print("ADJSCC trainable parameters: {:,}".format(parameter_count(adjscc)))
@@ -754,6 +800,45 @@ def train_command(args, device: torch.device) -> None:
     print_rate_summary(args.image_size, transmit_channels)
 
     for epoch in range(start_epoch + 1, start_epoch + args.epochs + 1):
+        def save_training_progress(
+            processed_batches: int,
+            total_batches: int,
+            percentage: float,
+        ) -> None:
+            progress_metadata = dict(metadata)
+            progress_metadata.update(
+                {
+                    "checkpoint_kind": "intra_epoch",
+                    "epoch_in_progress": epoch,
+                    "batch_in_epoch": processed_batches,
+                    "batches_in_epoch": total_batches,
+                    "progress_percent": percentage,
+                }
+            )
+            # `epoch` stores the number of fully completed epochs. Resuming this
+            # snapshot therefore repeats the current epoch instead of skipping it.
+            save_checkpoint(
+                str(last_checkpoint_path),
+                adjscc,
+                optimizer,
+                epoch=epoch - 1,
+                best_loss=best_loss,
+                metadata=progress_metadata,
+            )
+            print(
+                (
+                    "Saved intra-epoch checkpoint: {} "
+                    "(epoch {}, batch {}/{}, {:.2f}%)"
+                ).format(
+                    last_checkpoint_path,
+                    epoch,
+                    processed_batches,
+                    total_batches,
+                    percentage,
+                ),
+                flush=True,
+            )
+
         train_metrics = train_one_epoch(
             adjscc,
             vae,
@@ -769,6 +854,8 @@ def train_command(args, device: torch.device) -> None:
             max_batches=args.max_train_batches,
             epoch=epoch,
             log_every=args.log_every,
+            save_every_percent=args.save_every_percent,
+            checkpoint_callback=save_training_progress,
         )
         record = {"epoch": epoch, "train": train_metrics}
         message = (
@@ -808,23 +895,27 @@ def train_command(args, device: torch.device) -> None:
             )
             if val_metrics["loss"] < best_loss:
                 best_loss = val_metrics["loss"]
+                best_metadata = dict(metadata)
+                best_metadata["checkpoint_kind"] = "best"
                 save_checkpoint(
                     str(output_dir / "best.pt"),
                     adjscc,
                     optimizer,
                     epoch=epoch,
                     best_loss=best_loss,
-                    metadata=metadata,
+                    metadata=best_metadata,
                 )
                 message += " (best saved)"
 
+        completed_metadata = dict(metadata)
+        completed_metadata["checkpoint_kind"] = "epoch_complete"
         save_checkpoint(
-            str(output_dir / "last.pt"),
+            str(last_checkpoint_path),
             adjscc,
             optimizer,
             epoch=epoch,
             best_loss=best_loss,
-            metadata=metadata,
+            metadata=completed_metadata,
         )
         history["epochs"].append(record)
         save_json(str(history_path), history)
@@ -915,6 +1006,12 @@ def validate_args(args) -> None:
         raise ValueError("--val-every must be positive")
     if args.log_every < 0:
         raise ValueError("--log-every cannot be negative")
+    if (
+        not math.isfinite(args.save_every_percent)
+        or args.save_every_percent < 0
+        or args.save_every_percent > 100
+    ):
+        raise ValueError("--save-every-percent must be between 0 and 100")
     if args.latent_loss_weight < 0 or args.image_loss_weight < 0:
         raise ValueError("loss weights cannot be negative")
     if args.latent_loss_weight == 0 and args.image_loss_weight == 0:
@@ -974,6 +1071,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=100,
         type=int,
         help="print train/evaluation progress every N batches; 0 disables it",
+    )
+    parser.add_argument(
+        "--save-every-percent",
+        default=0.0,
+        type=float,
+        help=(
+            "overwrite last.pt every N percent of an epoch; "
+            "0 keeps epoch-end-only saving"
+        ),
     )
     parser.add_argument("--resume")
     parser.add_argument("--checkpoint")
