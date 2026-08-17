@@ -1,0 +1,85 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{resfusion}
+\@writefile{toc}{\contentsline {section}{\numberline {1}目的と結論}{3}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.1}検証したい仮説}{3}{subsection.1.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.2}本メモの推奨構成}{3}{subsection.1.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}既存の分布測定が示す問題}{3}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}1000画像での測定}{3}{subsection.2.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces clean \(z_0\) とADJSCC復元 \(\hat  z_0\) の分布統計}}{4}{table.1}\protected@file@percent }
+\newlabel{tab:latent-stat}{{1}{4}{clean \(z_0\) とADJSCC復元 \(\hat z_0\) の分布統計}{table.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}forward diffusionで差が見えなくなることの解釈}{4}{subsection.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}記号とシステムモデル}{4}{section.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}記号}{4}{subsection.3.1}\protected@file@percent }
+\citation{resfusion}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}end-to-endの信号経路}{5}{subsection.3.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}ADJSCCとwireless channel}{5}{subsection.3.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Resfusionの原式をlatentへ移す}{5}{section.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}forward process}{5}{subsection.4.1}\protected@file@percent }
+\newlabel{eq:resfusion-transition}{{1}{5}{forward process}{equation.4.1}{}}
+\newlabel{eq:resfusion-forward}{{2}{5}{forward process}{equation.4.2}{}}
+\citation{ddpm}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Resfusionを劣化latentから開始できる理由}{6}{subsection.4.2}\protected@file@percent }
+\newlabel{eq:smooth-equivalence}{{3}{6}{Resfusionを劣化latentから開始できる理由}{equation.4.3}{}}
+\newlabel{eq:resfusion-init}{{4}{6}{Resfusionを劣化latentから開始できる理由}{equation.4.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}residual noise prediction}{6}{subsection.4.3}\protected@file@percent }
+\newlabel{eq:resnoise}{{5}{6}{residual noise prediction}{equation.4.5}{}}
+\newlabel{eq:resnoise-loss}{{6}{6}{residual noise prediction}{equation.4.6}{}}
+\newlabel{eq:resfusion-reverse}{{7}{6}{residual noise prediction}{equation.4.7}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Stable Diffusionへの途中handover}{6}{section.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}直接handoverが正しくない理由}{6}{subsection.5.1}\protected@file@percent }
+\newlabel{eq:sd-forward}{{8}{6}{直接handoverが正しくない理由}{equation.5.8}{}}
+\newlabel{eq:handover-gap}{{9}{7}{直接handoverが正しくない理由}{equation.5.9}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}推奨bridge：残差を明示的に除去する}{7}{subsection.5.2}\protected@file@percent }
+\newlabel{eq:bridge}{{10}{7}{推奨bridge：残差を明示的に除去する}{equation.5.10}{}}
+\newlabel{eq:residual-loss}{{11}{7}{推奨bridge：残差を明示的に除去する}{equation.5.11}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}handover sample alignment loss}{7}{subsection.5.3}\protected@file@percent }
+\newlabel{eq:handover-loss}{{12}{7}{handover sample alignment loss}{equation.5.12}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}Stable Diffusion U-Netによるinterface loss}{7}{subsection.5.4}\protected@file@percent }
+\newlabel{eq:score-loss}{{13}{7}{Stable Diffusion U-Netによるinterface loss}{equation.5.13}{}}
+\citation{resfusion-code}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.5}moment/covariance lossは補助項とする}{8}{subsection.5.5}\protected@file@percent }
+\newlabel{eq:stat-loss}{{14}{8}{moment/covariance lossは補助項とする}{equation.5.14}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.6}総loss}{8}{subsection.5.6}\protected@file@percent }
+\newlabel{eq:total-loss}{{15}{8}{総loss}{equation.5.15}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.7}別scheduleを使う場合の安全なbridge}{8}{subsection.5.7}\protected@file@percent }
+\newlabel{eq:renoise-bridge}{{16}{8}{別scheduleを使う場合の安全なbridge}{equation.5.16}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {6}Latent Resfusionのnetwork設計}{9}{section.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}入出力}{9}{subsection.6.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}handover範囲の学習}{9}{subsection.6.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}学習手順}{9}{section.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}dataset pairの生成}{9}{subsection.7.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}段階的training}{10}{subsection.7.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Phase 0：式とscaleのunit test}{10}{section*.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Phase 1：Resfusion本体}{10}{section*.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Phase 2：Stable Diffusion interface alignment}{10}{section*.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Phase 3：任意のjoint fine-tuning}{10}{section*.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}推奨するbatch内sampling}{10}{subsection.7.3}\protected@file@percent }
+\citation{ddim}
+\@writefile{toc}{\contentsline {section}{\numberline {8}推論手順}{11}{section.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.1}共有schedule・明示bridge方式}{11}{subsection.8.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.2}疑似コード}{11}{subsection.8.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {9}評価計画}{12}{section.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.1}比較系}{12}{subsection.9.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.2}測定量}{12}{subsection.9.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{latent fidelity}{12}{section*.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{handover alignment}{12}{section*.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{image fidelity/perception}{12}{section*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{通信・計算量}{12}{section*.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.3}主要ablation}{12}{subsection.9.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {10}成功条件と失敗の切り分け}{13}{section.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {10.1}段階ごとの成功条件}{13}{subsection.10.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {10.2}想定される失敗と診断}{13}{subsection.10.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {11}実装へ落とす際の変更点}{13}{section.11}\protected@file@percent }
+\citation{resfusion}
+\citation{resfusion-code}
+\bibcite{resfusion}{1}
+\bibcite{ddpm}{2}
+\bibcite{ddim}{3}
+\@writefile{toc}{\contentsline {section}{\numberline {12}研究上の注意}{14}{section.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {13}最小実験の実行順}{14}{section.13}\protected@file@percent }
+\bibcite{ldm}{4}
+\bibcite{resfusion-code}{5}
+\gdef \@abspage@last{15}

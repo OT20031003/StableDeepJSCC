@@ -1,0 +1,426 @@
+\documentclass[11pt,a4paper]{ltjsarticle}
+
+\usepackage[margin=24mm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs,tabularx,array}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!60!black,
+  pdftitle={5-step Latent ResfusionからStable Diffusionへの直接handover}
+}
+\renewcommand{\arraystretch}{1.18}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\N}{\mathcal{N}}
+
+\title{5-step Latent Resfusionから\\
+Stable Diffusionへの直接handover}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{目的}
+
+構成は次のとおりとする．
+\[
+\begin{aligned}
+x
+&\longrightarrow \text{VAE encoder}
+\longrightarrow z_0
+\longrightarrow \text{ADJSCC encoder} \\
+&\longrightarrow \text{wireless channel}
+\longrightarrow \text{ADJSCC decoder}
+\longrightarrow \hat z_0
+\longrightarrow \text{5-step Latent Resfusion} \\
+&\longrightarrow \text{Stable Diffusion}
+\longrightarrow \text{VAE decoder}.
+\end{aligned}
+\]
+
+Resfusionは原論文\cite{resfusion}と公式実装\cite{resfusion-code}どおりの
+residual noiseだけを学習する．追加のresidual head，bridge network，
+score loss，統計loss，画像lossは使わない．
+
+推論時には，Resfusionを0回から5回まで実行した各状態を
+Stable Diffusionへ直接渡せるようにする．ここで「0回」は
+Resfusionの初期状態をそのまま渡す場合，「5回」は5回すべてdenoiseした後を表す．
+
+\section{学習用latent pair}
+
+画像 \(x\) からStable Diffusionのscaled VAE latentを作る．
+\[
+  z_0=s\,E_{\mathrm{VAE}}(x),
+  \qquad s=0.18215.
+\]
+このlatentをADJSCCで伝送する．
+\[
+\begin{aligned}
+  u &= E_{\mathrm{JSCC}}(z_0),\\
+  y &= \operatorname{Channel}(u),\\
+  \hat z_0 &= D_{\mathrm{JSCC}}(y).
+\end{aligned}
+\]
+したがって，Resfusionのpaired dataは
+\[
+  (\text{degraded latent},\text{clean latent})
+  =
+  (\hat z_0,z_0)
+\]
+であり，prior residualは
+\begin{equation}
+  R=\hat z_0-z_0
+  \label{eq:residual}
+\end{equation}
+となる．VAEと学習済みADJSCCは固定し，Latent Resfusionだけを学習する．
+
+scaled latentはRGB画像ではないため，公式RGB実装にある
+\([0,1]\to[-1,1]\) 変換と \([-1,1]\) clampは行わない．
+
+\section{論文どおりのResfusion学習}
+
+\subsection{forward process}
+
+\[
+  \alpha_t=1-\beta_t,
+  \qquad
+  \bar\alpha_t=\prod_{i=0}^{t}\alpha_i.
+\]
+以下では，質問中の \(\alpha_t\) をcumulative alpha
+\(\bar\alpha_t\) として表記する．
+
+Resfusionのforward stateを
+\begin{equation}
+  v_t
+  =
+  \sqrt{\bar\alpha_t}\,z_0
+  +
+  \left(1-\sqrt{\bar\alpha_t}\right)R
+  +
+  \sqrt{1-\bar\alpha_t}\,\epsilon,
+  \qquad
+  \epsilon\sim\N(0,I)
+  \label{eq:forward}
+\end{equation}
+とする．式\eqref{eq:residual}を代入すると
+\begin{equation}
+  v_t
+  =
+  \left(2\sqrt{\bar\alpha_t}-1\right)z_0
+  +
+  \left(1-\sqrt{\bar\alpha_t}\right)\hat z_0
+  +
+  \sqrt{1-\bar\alpha_t}\,\epsilon
+  \label{eq:smooth}
+\end{equation}
+となる．
+
+\subsection{学習target}
+
+Resfusion U-Netが予測するresidual noiseは
+\begin{equation}
+  \eta_t
+  =
+  \epsilon
+  +
+  \frac{
+    \left(1-\sqrt{\alpha_t}\right)
+    \sqrt{1-\bar\alpha_t}
+  }{\beta_t}R
+  \label{eq:resnoise}
+\end{equation}
+である．
+
+各batchで
+\[
+  t\sim\operatorname{Uniform}\{0,1,2,3,4\},
+  \qquad
+  \epsilon\sim\N(0,I)
+\]
+をsampleし，式\eqref{eq:forward}で \(v_t\) を作る．
+networkへの入力は
+\[
+  (v_t,\hat z_0,t)
+\]
+だけであり，4チャネルの \(v_t\) と4チャネルの \(\hat z_0\) を結合するため，
+U-Netの入力は8チャネル，出力は4チャネルとする．
+
+\subsection{loss}
+
+学習lossは原論文のMSEだけとする．
+\begin{equation}
+\boxed{
+  \mathcal L_{\mathrm{Resfusion}}
+  =
+  \E_{z_0,\hat z_0,t,\epsilon}
+  \left[
+    \left\|
+      \eta_\theta(v_t,\hat z_0,t)-\eta_t
+    \right\|_2^2
+  \right]
+}
+\label{eq:loss}
+\end{equation}
+
+使用しないものは次のとおりである．
+\[
+  \mathcal L_R,\quad
+  \mathcal L_{\mathrm{bridge}},\quad
+  \mathcal L_{\mathrm{score}},\quad
+  \mathcal L_{\mathrm{stat}},\quad
+  \mathcal L_{\mathrm{image}}.
+\]
+また，SNR専用embeddingや追加headも設けない．channel状態の違いは
+degraded condition \(\hat z_0\) 自体からnetworkへ伝わる．
+
+\section{5-step Resfusion}
+
+\subsection{truncated schedule}
+
+公式復元設定と同じ
+\[
+  T=12,\qquad \text{LinearProScheduler}
+\]
+を使用する．truncated strategyにより
+\[
+  \sqrt{\bar\alpha_{t_\star}}=\frac12
+\]
+となる点でscheduleが切られ，実際に使用する時刻は
+\[
+  t_{\mathrm R}=4,3,2,1,0
+\]
+の5個になる．したがってU-Net評価は5回である．
+
+Resfusion初期状態は
+\begin{equation}
+\begin{aligned}
+  v_4
+  &=
+  \sqrt{\bar\alpha^{\mathrm R}_4}\,\hat z_0
+  +
+  \sqrt{1-\bar\alpha^{\mathrm R}_4}\,\epsilon\\
+  &=
+  0.5\,\hat z_0+\sqrt{0.75}\,\epsilon
+\end{aligned}
+\label{eq:init}
+\end{equation}
+とする．
+
+各reverse stepは
+\begin{equation}
+  v_{t-1}
+  =
+  \frac{1}{\sqrt{\alpha_t}}
+  \left(
+    v_t
+    -
+    \frac{\beta_t}{\sqrt{1-\bar\alpha_t}}
+    \eta_\theta(v_t,\hat z_0,t)
+  \right)
+  +
+  \sqrt{\tilde\beta_t}\,\xi,
+  \qquad \xi\sim\N(0,I)
+  \label{eq:reverse}
+\end{equation}
+である．最後のstepでは \(\xi=0\) とする．
+
+\subsection{0--5 stepの定義}
+
+Resfusionを完了した回数を \(k\) とする．
+\[
+\begin{array}{ccl}
+  k=0 &: & v_4 \quad\text{（初期化直後）},\\
+  k=1 &: & v_3 \quad\text{（\(t_{\mathrm R}=4\) を1回denoise後）},\\
+  k=2 &: & v_2,\\
+  k=3 &: & v_1,\\
+  k=4 &: & v_0,\\
+  k=5 &: & v_{-1}\quad\text{（5回denoise後のclean推定）}.
+\end{array}
+\]
+この6状態のいずれからでもStable Diffusionへhandoverする．
+
+\section{Stable Diffusion timestepとの対応}
+
+\subsection{対応規則}
+
+ResfusionとStable Diffusionではnoise scheduleが異なるため，
+Resfusionのstep番号をそのままStable Diffusionへ渡してはいけない．
+
+質問中の
+\[
+  \left(1-\sqrt{\bar\alpha_t}\right)\hat z_0
+  +
+  \sqrt{1-\bar\alpha_t}\,\epsilon
+\]
+に現れる係数をnoise levelの識別に使う．Resfusion状態 \(k\) と
+Stable Diffusion raw timestep \(\tau\) の距離を
+\begin{equation}
+\begin{aligned}
+d(k,\tau)
+={}&
+\left[
+  \left(1-\sqrt{\bar\alpha^{\mathrm R}_k}\right)
+  -
+  \left(1-\sqrt{\bar\alpha^{\mathrm{SD}}_\tau}\right)
+\right]^2\\
+&+
+\left[
+  \sqrt{1-\bar\alpha^{\mathrm R}_k}
+  -
+  \sqrt{1-\bar\alpha^{\mathrm{SD}}_\tau}
+\right]^2
+\end{aligned}
+\label{eq:distance}
+\end{equation}
+とし，
+\begin{equation}
+\boxed{
+  \tau_k
+  =
+  \arg\min_{\tau\in\{0,\ldots,999\}}d(k,\tau)
+}
+\label{eq:mapping}
+\end{equation}
+でStable Diffusion側の時刻を選ぶ．
+
+これは，signal/noise比
+\[
+  \rho_t
+  =
+  \frac{\sqrt{1-\bar\alpha_t}}
+       {\sqrt{\bar\alpha_t}}
+\]
+が最も近い時刻を選ぶことと実質的に同じである．
+
+\subsection{本プロジェクトでの対応表}
+
+Stable Diffusion v1の
+\[
+  T_{\mathrm{SD}}=1000,\qquad
+  \texttt{linear\_start}=0.00085,\qquad
+  \texttt{linear\_end}=0.012
+\]
+を用いる．
+\path{ldm/modules/diffusionmodules/util.py} と同じく，
+端点の平方根を線形補間してから二乗した \(\beta_\tau^{\mathrm{SD}}\) を使う．
+
+\begin{table}[htbp]
+  \centering
+  \small
+  \caption{Resfusionの0--5 denoise回数とStable Diffusion raw timestep}
+  \label{tab:mapping}
+  \begin{tabular}{crrrrr}
+    \toprule
+    完了回数 \(k\) &
+    Resfusion state &
+    \(\bar\alpha^{\mathrm R}\) &
+    \(\sqrt{\bar\alpha^{\mathrm R}}\) &
+    \(\sqrt{1-\bar\alpha^{\mathrm R}}\) &
+    SD raw \(\tau_k\) \\
+    \midrule
+    0 & \(v_4\)    & 0.250000 & 0.500000 & 0.866025 & 520 \\
+    1 & \(v_3\)    & 0.310431 & 0.557163 & 0.830403 & 475 \\
+    2 & \(v_2\)    & 0.575518 & 0.758629 & 0.651523 & 309 \\
+    3 & \(v_1\)    & 0.833902 & 0.913182 & 0.407552 & 146 \\
+    4 & \(v_0\)    & 0.991667 & 0.995825 & 0.091287 & 9 \\
+    5 & \(v_{-1}\) & 1.000000 & 1.000000 & 0.000000 & 0 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+よってhandover先は
+\[
+\boxed{
+  k=0,1,2,3,4,5
+  \quad\longrightarrow\quad
+  \tau_k=520,475,309,146,9,0
+}
+\]
+となる．
+
+\(k=5\) はnoise 0であるが，Stable Diffusionの既存scheduleには
+厳密なnoise 0のraw timestepがない．そのため最も近い \(\tau=0\) を使う．
+
+\section{直接handover推論}
+
+handoverでは補正，re-noise，residual subtractionを一切行わない．
+Resfusionの現在状態をそのままStable Diffusion latentとして使う．
+\begin{equation}
+\boxed{
+  z^{\mathrm{SD}}_{\tau_k}
+  \leftarrow
+  v^{(k)}
+}
+\label{eq:direct}
+\end{equation}
+ここで \(v^{(k)}\) はResfusionを \(k\) 回denoiseした状態である．
+
+推論手順は次のとおりである．
+\begin{enumerate}
+  \item ADJSCC decoderから \(\hat z_0\) を得る．
+  \item 式\eqref{eq:init}で \(v_4\) を作る．
+  \item 選択した \(k\) 回だけ式\eqref{eq:reverse}を実行する．
+  \item 表\ref{tab:mapping}から \(\tau_k\) を得る．
+  \item 式\eqref{eq:direct}によりcurrent stateを直接Stable Diffusionへ渡す．
+  \item Stable Diffusionをraw timestep \(\tau_k\) から0まで実行する．
+  \item 得られたscaled latentをVAE decoderで画像へ戻す．
+\end{enumerate}
+
+\subsection{疑似コード}
+
+\begin{verbatim}
+z_hat0 = adjscc_decode(received_signal)
+
+v = 0.5 * z_hat0 + sqrt(0.75) * randn_like(z_hat0)
+
+sd_timestep = [520, 475, 309, 146, 9, 0]
+
+for k in range(6):
+    if k == selected_handover_step:
+        z_out = stable_diffusion_reverse(
+            latent=v,
+            start_raw_timestep=sd_timestep[k]
+        )
+        image_out = vae_decode_scaled(z_out)
+        break
+
+    # k=0,...,4 のときだけ次のResfusion stepを実行
+    t_resfusion = 4 - k
+    eta_hat = resfusion_unet(v, z_hat0, t_resfusion)
+    v = resfusion_reverse_step(v, eta_hat, t_resfusion)
+\end{verbatim}
+
+\section{最小構成のまとめ}
+
+\begin{itemize}
+  \item Resfusionは公式設定と同じ5回のdenoiseを行う．
+  \item 学習targetはresidual noise \(\eta_t\) だけである．
+  \item lossは式\eqref{eq:loss}のMSEだけである．
+  \item U-Netは8チャネル入力，4チャネル出力である．
+  \item 0--5回の各状態を直接Stable Diffusionへ渡せる．
+  \item 対応raw timestepは \(520,475,309,146,9,0\) である．
+  \item handover時にtensorの補正や追加noiseは行わない．
+\end{itemize}
+
+\begin{thebibliography}{9}
+
+\bibitem{resfusion}
+Z. Shi et al.,
+\newblock ``Resfusion: Denoising Diffusion Probabilistic Models for
+Image Restoration Based on Prior Residual Noise,''
+\newblock \emph{NeurIPS 2024}.
+\newblock \url{https://arxiv.org/abs/2311.14900}
+
+\bibitem{resfusion-code}
+NKICSL,
+\newblock ``Official implementation of Resfusion.''
+\newblock \url{https://github.com/nkicsl/Resfusion}
+
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,50 @@
+\contentsline {section}{\numberline {1}目的と結論}{3}{section.1}%
+\contentsline {subsection}{\numberline {1.1}検証したい仮説}{3}{subsection.1.1}%
+\contentsline {subsection}{\numberline {1.2}本メモの推奨構成}{3}{subsection.1.2}%
+\contentsline {section}{\numberline {2}既存の分布測定が示す問題}{3}{section.2}%
+\contentsline {subsection}{\numberline {2.1}1000画像での測定}{3}{subsection.2.1}%
+\contentsline {subsection}{\numberline {2.2}forward diffusionで差が見えなくなることの解釈}{4}{subsection.2.2}%
+\contentsline {section}{\numberline {3}記号とシステムモデル}{4}{section.3}%
+\contentsline {subsection}{\numberline {3.1}記号}{4}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}end-to-endの信号経路}{5}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}ADJSCCとwireless channel}{5}{subsection.3.3}%
+\contentsline {section}{\numberline {4}Resfusionの原式をlatentへ移す}{5}{section.4}%
+\contentsline {subsection}{\numberline {4.1}forward process}{5}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}Resfusionを劣化latentから開始できる理由}{6}{subsection.4.2}%
+\contentsline {subsection}{\numberline {4.3}residual noise prediction}{6}{subsection.4.3}%
+\contentsline {section}{\numberline {5}Stable Diffusionへの途中handover}{6}{section.5}%
+\contentsline {subsection}{\numberline {5.1}直接handoverが正しくない理由}{6}{subsection.5.1}%
+\contentsline {subsection}{\numberline {5.2}推奨bridge：残差を明示的に除去する}{7}{subsection.5.2}%
+\contentsline {subsection}{\numberline {5.3}handover sample alignment loss}{7}{subsection.5.3}%
+\contentsline {subsection}{\numberline {5.4}Stable Diffusion U-Netによるinterface loss}{7}{subsection.5.4}%
+\contentsline {subsection}{\numberline {5.5}moment/covariance lossは補助項とする}{8}{subsection.5.5}%
+\contentsline {subsection}{\numberline {5.6}総loss}{8}{subsection.5.6}%
+\contentsline {subsection}{\numberline {5.7}別scheduleを使う場合の安全なbridge}{8}{subsection.5.7}%
+\contentsline {section}{\numberline {6}Latent Resfusionのnetwork設計}{9}{section.6}%
+\contentsline {subsection}{\numberline {6.1}入出力}{9}{subsection.6.1}%
+\contentsline {subsection}{\numberline {6.2}handover範囲の学習}{9}{subsection.6.2}%
+\contentsline {section}{\numberline {7}学習手順}{9}{section.7}%
+\contentsline {subsection}{\numberline {7.1}dataset pairの生成}{9}{subsection.7.1}%
+\contentsline {subsection}{\numberline {7.2}段階的training}{10}{subsection.7.2}%
+\contentsline {paragraph}{Phase 0：式とscaleのunit test}{10}{section*.2}%
+\contentsline {paragraph}{Phase 1：Resfusion本体}{10}{section*.3}%
+\contentsline {paragraph}{Phase 2：Stable Diffusion interface alignment}{10}{section*.4}%
+\contentsline {paragraph}{Phase 3：任意のjoint fine-tuning}{10}{section*.5}%
+\contentsline {subsection}{\numberline {7.3}推奨するbatch内sampling}{10}{subsection.7.3}%
+\contentsline {section}{\numberline {8}推論手順}{11}{section.8}%
+\contentsline {subsection}{\numberline {8.1}共有schedule・明示bridge方式}{11}{subsection.8.1}%
+\contentsline {subsection}{\numberline {8.2}疑似コード}{11}{subsection.8.2}%
+\contentsline {section}{\numberline {9}評価計画}{12}{section.9}%
+\contentsline {subsection}{\numberline {9.1}比較系}{12}{subsection.9.1}%
+\contentsline {subsection}{\numberline {9.2}測定量}{12}{subsection.9.2}%
+\contentsline {paragraph}{latent fidelity}{12}{section*.6}%
+\contentsline {paragraph}{handover alignment}{12}{section*.7}%
+\contentsline {paragraph}{image fidelity/perception}{12}{section*.8}%
+\contentsline {paragraph}{通信・計算量}{12}{section*.9}%
+\contentsline {subsection}{\numberline {9.3}主要ablation}{12}{subsection.9.3}%
+\contentsline {section}{\numberline {10}成功条件と失敗の切り分け}{13}{section.10}%
+\contentsline {subsection}{\numberline {10.1}段階ごとの成功条件}{13}{subsection.10.1}%
+\contentsline {subsection}{\numberline {10.2}想定される失敗と診断}{13}{subsection.10.2}%
+\contentsline {section}{\numberline {11}実装へ落とす際の変更点}{13}{section.11}%
+\contentsline {section}{\numberline {12}研究上の注意}{14}{section.12}%
+\contentsline {section}{\numberline {13}最小実験の実行順}{14}{section.13}%

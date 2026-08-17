@@ -1,0 +1,942 @@
+\documentclass[11pt,a4paper]{ltjsarticle}
+
+\usepackage[margin=23mm]{geometry}
+\usepackage{amsmath,amssymb,mathtools,bm}
+\usepackage{booktabs,tabularx,array}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  citecolor=blue!50!black,
+  urlcolor=blue!60!black,
+  pdftitle={ADJSCC潜在分布を補正してStable DiffusionへhandoverするLatent Resfusion},
+  pdfauthor={}
+}
+
+\setlist[itemize]{leftmargin=2em,itemsep=.25em,topsep=.35em}
+\setlist[enumerate]{leftmargin=2.2em,itemsep=.3em,topsep=.35em}
+\renewcommand{\arraystretch}{1.18}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\CN}{\mathcal{CN}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\tr}{\operatorname{tr}}
+\newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\stopgrad}{\operatorname{sg}}
+\newcommand{\mse}{\operatorname{MSE}}
+\newcommand{\snr}{\operatorname{SNR}}
+
+\title{ADJSCC潜在分布を補正してStable Diffusionへ\\
+handoverするLatent Resfusion\\
+\large システムモデル・学習方法・評価計画}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本メモは，Stable Diffusionのscaled VAE latentをADJSCCで伝送したとき，
+復元潜在がVAE潜在分布から外れる問題に対し，Resfusionを潜在空間へ導入する
+システムを定式化する．想定する経路は
+\[
+\begin{aligned}
+  \text{VAE encoder}
+  &\to \text{ADJSCC encoder}
+  \to \text{wireless channel}
+  \to \text{ADJSCC decoder} \\
+  &\to \text{Latent Resfusion}
+  \to \text{Stable Diffusion}
+  \to \text{VAE decoder}
+\end{aligned}
+\]
+である．
+Resfusion原論文\cite{resfusion}はRGB画像復元を対象としており，潜在空間での利用と
+Stable Diffusionへの途中handoverは本プロジェクト固有の拡張である．
+特に，Resfusionの途中状態をそのままStable Diffusionへ渡すと，
+残差項が残るためStable Diffusionのforward training distributionには一致しない．
+そこで，残差推定headと明示的なbridgeを追加し，handover状態を
+Stable Diffusionが学習した分布へ写す方法を提案する．
+\end{abstract}
+
+\tableofcontents
+\clearpage
+
+\section{目的と結論}
+
+\subsection{検証したい仮説}
+
+入力画像を \(x\)，Stable Diffusionのscaled VAE latentを \(z_0\)，
+ADJSCC復元潜在を \(\hat z_0\) とする．現在の仮説は次の連鎖である．
+\begin{enumerate}
+  \item \(\hat z_0\) は \(z_0\) の分布，とくに分散とチャネル間共分散から外れる．
+  \item 通常のforward diffusionを適用しても，中間時刻では
+        \(\hat z_t\) と \(z_t\) の分布差が残る．
+  \item Stable DiffusionのU-Netは \(z_t\) 上で学習されているため，
+        out-of-distributionな \(\hat z_t\) ではnoise/score prediction誤差が増える．
+  \item その誤差が逆拡散中に蓄積し，顔・細部・色・質感のartifactとなる．
+\end{enumerate}
+
+\subsection{本メモの推奨構成}
+
+最初の実装では，以下を採用する．
+\begin{itemize}
+  \item VAE，学習済みADJSCC，Stable Diffusionは凍結する．
+  \item ResfusionをRGBではなく \(4\times32\times32\) のscaled latent上で学習する．
+  \item ResfusionとStable Diffusionで同じ1000-stepのraw timestepと
+        \(\bar\alpha_t\) を共有する．
+  \item Latent Resfusionはresnoiseに加えて通信残差
+        \(R=\hat z_0-z_0\) を推定する．
+  \item handover時に
+        \(z^{\mathrm H}_{t}=v_t-(1-\sqrt{\bar\alpha_t})\hat R_\theta\)
+        という明示的bridgeを通す．
+  \item 凍結したStable Diffusion U-Netを教師として，handover前後の
+        noise predictionを一致させるlossを加える．
+\end{itemize}
+ここで \(v_t\) はResfusion側の状態であり，Stable Diffusion側の通常状態
+\(z_t\) と区別する．
+
+\section{既存の分布測定が示す問題}
+
+\subsection{1000画像での測定}
+
+\path{ADJSCC/outputs/latent_distribution/C32_best.json} は，
+FFHQ validation 1000画像，scaled VAE latent \(4\times32\times32\)，
+ADJSCC checkpoint \path{sd_vae_ffhq_stage1_C32/best.pt} を用いた測定である．
+表\ref{tab:latent-stat}に主要量をまとめる．
+共分散誤差は
+\[
+  e_{\mathrm{cov}}
+  =
+  \frac{\lVert C_{\hat z}-C_z\rVert_{\mathrm F}}
+       {\lVert C_z\rVert_{\mathrm F}},
+  \qquad
+  r_{\mathrm{eff}}(C)
+  =
+  \frac{\tr(C)^2}{\tr(C^2)}
+\]
+で定義した．後者は4チャネルの分散が何方向へ実効的に広がっているかを表す
+participation ratioである．
+
+\begin{table}[htbp]
+  \centering
+  \small
+  \caption{clean \(z_0\) とADJSCC復元 \(\hat z_0\) の分布統計}
+  \label{tab:latent-stat}
+  \begin{tabular}{lrrrrrr}
+    \toprule
+    条件 & global mean & global std & std比
+         & \(\tr(C)/\tr(C_z)\) & \(e_{\mathrm{cov}}\) & \(r_{\mathrm{eff}}\) \\
+    \midrule
+    clean \(z_0\) & 0.0088 & 0.8546 & 1.000 & 1.000 & 0.000 & 2.629 \\
+    \(-10\) dB & 0.0190 & 0.6414 & 0.750 & 0.534 & 0.403 & 1.653 \\
+    \(-5\) dB  & 0.0159 & 0.6917 & 0.809 & 0.635 & 0.319 & 1.767 \\
+    \(0\) dB   & 0.0188 & 0.7265 & 0.850 & 0.707 & 0.260 & 1.886 \\
+    \(5\) dB   & 0.0198 & 0.7424 & 0.869 & 0.740 & 0.232 & 1.947 \\
+    \(10\) dB  & 0.0208 & 0.7499 & 0.877 & 0.756 & 0.222 & 1.959 \\
+    \(20\) dB  & 0.0206 & 0.7534 & 0.882 & 0.763 & 0.216 & 1.972 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+高SNRの20\,dBでもglobal stdはcleanの約88.2\%，共分散traceは約76.3\%であり，
+単なる無線雑音だけでなくADJSCC encoder--decoder自体の縮退・バイアスが残っている．
+また \(r_{\mathrm{eff}}\) の低下は，4チャネルの情報が一部の共分散固有方向へ
+偏っていることを示す．したがって，global mean/stdだけのaffine補正では不十分である．
+
+\subsection{forward diffusionで差が見えなくなることの解釈}
+
+20\,dBにおけるclean \(z_t\) とADJSCC \(\hat z_t\) の共分散相対誤差は，
+\(t=0,100,250,500,750,999\) でそれぞれ
+\[
+  0.215,\quad 0.193,\quad 0.144,\quad
+  0.0545,\quad 0.0106,\quad 0.0008
+\]
+である．大きな \(t\) で差が小さくなるのは，両者が同じ標準Gaussian noiseに
+支配されるためである．これは意味内容が回復したことを意味しない．
+むしろ，handoverを遅い時刻（強いnoise）に置けばdistribution alignmentは容易だが，
+受信latentに含まれるidentityや細部を捨てやすいというtrade-offを示す．
+
+\section{記号とシステムモデル}
+
+\subsection{記号}
+
+\begin{table}[htbp]
+  \centering
+  \begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{.22\linewidth}X}
+    \toprule
+    記号 & 意味 \\
+    \midrule
+    \(x\) & 送信元画像 \\
+    \(z_0\in\R^{4\times H/8\times W/8}\) &
+      Stable Diffusion用のscaled clean VAE latent \\
+    \(\hat z_0\) & ADJSCC decoderが復元したscaled latent \\
+    \(R=\hat z_0-z_0\) & 通信系全体が生じさせたlatent residual \\
+    \(v_t\) & Resfusionのforward/reverse state \\
+    \(z_t\) & Stable Diffusion標準forward processのstate \\
+    \(t_\star\) & \(\sqrt{\bar\alpha_t}\simeq 1/2\) となるResfusion開始点 \\
+    \(t_{\mathrm H}\) & ResfusionからStable Diffusionへのhandover raw timestep \\
+    \(c\) & Stable Diffusionのtext condition（初期実験ではnull condition） \\
+    \(\gamma\) & 実際のchannel SNR（dB表記の場合は \(\gamma_{\mathrm{dB}}\)） \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\subsection{end-to-endの信号経路}
+
+\begin{center}
+\small
+\fbox{\parbox{.95\linewidth}{
+\[
+\begin{aligned}
+x
+&\xrightarrow[\text{scale }s=0.18215]{\text{VAE encoder}}
+z_0
+\xrightarrow{f_{\mathrm{JSCC}}}
+u
+\xrightarrow{\text{wireless channel}}
+y
+\xrightarrow{g_{\mathrm{JSCC}}}
+\hat z_0 \\
+&\xrightarrow[\hat z_0\text{で条件付け}]{\text{Latent Resfusion}}
+v_{t_{\mathrm H}}
+\xrightarrow{\text{distribution bridge}}
+z^{\mathrm H}_{t_{\mathrm H}}
+\xrightarrow[t_{\mathrm H}\to0]{\text{frozen Stable Diffusion}}
+\tilde z_0
+\xrightarrow{\text{VAE decoder}}
+\tilde x .
+\end{aligned}
+\]
+}}
+\end{center}
+
+VAE encoderのposteriorをsampleする場合は
+\[
+  z^{\mathrm{raw}}\sim q_{\mathrm{VAE}}(z\mid x),
+  \qquad z_0=s z^{\mathrm{raw}},\qquad s=0.18215
+\]
+とし，clean教師とADJSCC入力で必ず同一sampleを使う．
+posterior meanを使う実験では両方ともmeanに統一する．scaleの掛け忘れや二重適用は，
+本研究で検出したい分布差と区別できなくなるため禁止する．
+
+\subsection{ADJSCCとwireless channel}
+
+ADJSCC encoderとdecoderを
+\[
+  u=f_{\mathrm{JSCC}}(z_0;\phi_{\mathrm e}),\qquad
+  \hat z_0=g_{\mathrm{JSCC}}(y,\gamma;\phi_{\mathrm d})
+\]
+とする．複素AWGN channelの例では
+\[
+  y=u+n_{\mathrm{ch}},\qquad
+  n_{\mathrm{ch}}\sim\CN(0,N_0 I),\qquad
+  \frac{1}{n}\E\lVert u\rVert_2^2\le P,\qquad
+  \snr=\frac{P}{N_0}.
+\]
+実装がreal tensorでI/Qを2チャネルとして表す場合も，noise varianceの定義を
+この式と整合させる．学習時はSNRを固定せず，対象範囲
+\(\gamma_{\mathrm{dB}}\in[-10,20]\) からsampleし，同じ画像を再訪するたびに
+新しいchannel noiseを生成する．
+
+\section{Resfusionの原式をlatentへ移す}
+
+\subsection{forward process}
+
+Resfusion原論文\cite{resfusion}のclean imageを \(z_0\)，degraded imageを \(\hat z_0\) に
+置き換える．
+\[
+  R=\hat z_0-z_0,\qquad
+  \alpha_t=1-\beta_t,\qquad
+  \bar\alpha_t=\prod_{i=0}^{t}\alpha_i .
+\]
+ここからraw timestepは実装と同じ0-origin
+\(t\in\{0,\ldots,T-1\}\)で表す．1-step式の \(t=0\) は
+\(v_{-1}=z_0\) とみなすcode-compatibleな表記である．
+Resfusionの1-step transitionは
+\begin{equation}
+q(v_t\mid v_{t-1},R)
+=
+\N\!\left(
+  \sqrt{\alpha_t}v_{t-1}
+  (1-\sqrt{\alpha_t})R,\,
+  (1-\alpha_t)I
+\right).
+\label{eq:resfusion-transition}
+\end{equation}
+閉形式は
+\begin{equation}
+  v_t
+  =
+  \sqrt{\bar\alpha_t}z_0
+  (1-\sqrt{\bar\alpha_t})R
+  \sqrt{1-\bar\alpha_t}\,\epsilon,
+  \qquad \epsilon\sim\N(0,I).
+\label{eq:resfusion-forward}
+\end{equation}
+
+\subsection{Resfusionを劣化latentから開始できる理由}
+
+\(R=\hat z_0-z_0\) を式\eqref{eq:resfusion-forward}へ代入すると
+\begin{equation}
+  v_t
+  =
+  (2\sqrt{\bar\alpha_t}-1)z_0
+  (1-\sqrt{\bar\alpha_t})\hat z_0
+  \sqrt{1-\bar\alpha_t}\,\epsilon .
+\label{eq:smooth-equivalence}
+\end{equation}
+したがって
+\[
+  t_\star
+  =
+  \arg\min_t
+  \left|\sqrt{\bar\alpha_t}-\frac12\right|
+\]
+ではclean \(z_0\) の係数がほぼ0になり，未知のclean latentなしで
+\begin{equation}
+  v_{t_\star}
+  \simeq
+  \sqrt{\bar\alpha_{t_\star}}\,\hat z_0
+  +
+  \sqrt{1-\bar\alpha_{t_\star}}\,\epsilon
+\label{eq:resfusion-init}
+\end{equation}
+を生成できる．これがResfusionの加速点である．
+
+本リポジトリのStable Diffusion v1設定は1000 raw timesteps，
+\(\beta_{\mathrm{start}}=0.00085\)，
+\(\beta_{\mathrm{end}}=0.012\) である．
+\path{ldm/modules/diffusionmodules/util.py} の
+\texttt{make\_beta\_schedule("linear")} と同じ計算をすると，
+0-origin indexで
+\[
+  t_\star=520,\qquad
+  \sqrt{\bar\alpha_{520}}=0.50031
+\]
+となる．なお，この「linear」scheduleは端点の平方根を線形補間してから
+二乗する実装であり，\(\beta\) 自体の単純な線形補間とは異なる．
+
+\subsection{residual noise prediction}
+
+Resfusionが予測する教師信号（resnoise）を
+\begin{equation}
+  \eta_t
+  =
+  \epsilon
+  +
+  \frac{(1-\sqrt{\alpha_t})\sqrt{1-\bar\alpha_t}}
+       {\beta_t}R
+\label{eq:resnoise}
+\end{equation}
+とする．原論文の基本lossは
+\begin{equation}
+  \mathcal L_{\mathrm{RN}}
+  =
+  \E_{z_0,\hat z_0,t,\epsilon}
+  \left[
+    \lVert
+      \eta_\theta(v_t,\hat z_0,t,\gamma)-\eta_t
+    \rVert_2^2
+  \right].
+\label{eq:resnoise-loss}
+\end{equation}
+逆過程のDDPM形式\cite{ddpm}は
+\begin{equation}
+  v_{t-1}
+  =
+  \frac{1}{\sqrt{\alpha_t}}
+  \left(
+    v_t
+    -
+    \frac{\beta_t}{\sqrt{1-\bar\alpha_t}}
+    \eta_\theta(v_t,\hat z_0,t,\gamma)
+  \right)
+  +
+  \sigma_t\xi,
+\label{eq:resfusion-reverse}
+\end{equation}
+\[
+  \xi\sim\N(0,I),\qquad
+  \sigma_t^2=\tilde\beta_t
+  =
+  \frac{1-\bar\alpha_{t-1}}{1-\bar\alpha_t}\beta_t,
+\]
+であり，最終stepでは \(\xi=0\) とする．
+
+\section{Stable Diffusionへの途中handover}
+
+\subsection{直接handoverが正しくない理由}
+
+Stable DiffusionのU-Netが学習時に見る標準stateを
+\begin{equation}
+  z_t
+  =
+  \sqrt{\bar\alpha_t}z_0
+  +
+  \sqrt{1-\bar\alpha_t}\epsilon
+\label{eq:sd-forward}
+\end{equation}
+とする．Resfusion stateとの差は，式
+\eqref{eq:resfusion-forward}と\eqref{eq:sd-forward}から
+\begin{equation}
+  v_t-z_t
+  =
+  (1-\sqrt{\bar\alpha_t})R
+\label{eq:handover-gap}
+\end{equation}
+である．よって，Resfusionを何stepか実行したという理由だけで
+\(v_{t_{\mathrm H}}\) をそのままStable Diffusion U-Netへ入力すると，
+通信残差に比例するdistribution shiftが残る．
+これは本研究が解消したい問題をhandover地点に持ち込むことになる．
+
+\subsection{推奨bridge：残差を明示的に除去する}
+
+Latent Resfusion U-Netにresnoise headだけでなくresidual headを設け，
+\[
+  \hat R_\theta
+  =
+  R_\theta(v_t,\hat z_0,t,\gamma)
+\]
+を出力させる．handover stateを
+\begin{equation}
+  z^{\mathrm H}_{t_{\mathrm H}}
+  =
+  v_{t_{\mathrm H}}
+  -
+  (1-\sqrt{\bar\alpha_{t_{\mathrm H}}})
+  \hat R_\theta
+\label{eq:bridge}
+\end{equation}
+と定義する．\(\hat R_\theta=R\) なら
+\[
+  z^{\mathrm H}_{t_{\mathrm H}}
+  =
+  \sqrt{\bar\alpha_{t_{\mathrm H}}}z_0
+  +\sqrt{1-\bar\alpha_{t_{\mathrm H}}}\epsilon
+  =z_{t_{\mathrm H}},
+\]
+となり，sample単位でもStable Diffusionのforward training stateに一致する．
+平均・分散だけを合わせる補正より強い条件である．
+
+残差headの教師ありlossは
+\begin{equation}
+  \mathcal L_R
+  =
+  \E\lVert \hat R_\theta-R\rVert_1
+  \quad\text{または}\quad
+  \E\lVert \hat R_\theta-R\rVert_2^2 .
+\label{eq:residual-loss}
+\end{equation}
+外れ値の大きいlatentでは，初期実験にsmooth \(L_1\) を用い，
+MSEとのablationを取る．
+
+\subsection{handover sample alignment loss}
+
+学習時には式\eqref{eq:resfusion-forward}と同じGaussian noise \(\epsilon\) で
+Stable Diffusion教師state
+\[
+  z_t^{\mathrm{teacher}}
+  =
+  \sqrt{\bar\alpha_t}z_0
+  +\sqrt{1-\bar\alpha_t}\epsilon
+\]
+を作る．そして
+\begin{equation}
+  \mathcal L_{\mathrm H}
+  =
+  \E
+  \left[
+  w_t
+  \left\lVert
+    z_t^{\mathrm H}-z_t^{\mathrm{teacher}}
+  \right\rVert_2^2
+  \right]
+\label{eq:handover-loss}
+\end{equation}
+を最小化する．同一noiseを使わないと，正しいbridgeでも無関係なGaussian差を
+罰することになる．\(w_t\) は時刻間のscale差を抑える重みであり，
+最初は \(w_t=1\) としてよい．
+
+\subsection{Stable Diffusion U-Netによるinterface loss}
+
+凍結したStable Diffusion U-Netを
+\(\epsilon_\psi^{\mathrm{SD}}(z,t,c)\) とする．
+handover stateがU-Netにとって同等であることを直接学習するため，
+\begin{equation}
+\begin{split}
+  \mathcal L_{\mathrm{score}}
+  =
+  \E\bigl[
+  \lVert&
+    \epsilon_\psi^{\mathrm{SD}}
+      (z_t^{\mathrm H},t,c)
+    {}-
+    \stopgrad\{
+      \epsilon_\psi^{\mathrm{SD}}
+      (z_t^{\mathrm{teacher}},t,c)
+    \}
+  \rVert_2^2
+  \bigr].
+\end{split}
+\label{eq:score-loss}
+\end{equation}
+Stable Diffusionのparameterは \(\texttt{requires\_grad=False}\) にするが，
+左側のstudent forwardを \(\texttt{torch.no\_grad()}\) で囲んではならない．
+U-Netの重みは更新しなくても，入力 \(z_t^{\mathrm H}\) からResfusionへ
+gradientを戻す必要がある．teacher側だけはno-gradまたはdetachしてよい．
+
+初期実験ではtext condition \(c\) をempty promptに固定し，
+classifier-free guidance scaleは1とする．強いguidanceは受信したidentityより
+prompt priorを優先する可能性があり，distribution補正そのものの効果を
+評価しにくくするためである．
+
+\subsection{moment/covariance lossは補助項とする}
+
+mini-batchと空間位置をまとめて4次元観測とみなし，
+\(\mu(\cdot)\in\R^4\)，\(C(\cdot)\in\R^{4\times4}\) を計算する．
+\begin{equation}
+\begin{split}
+  \mathcal L_{\mathrm{stat}}
+  ={}&
+  \lVert\mu(z_t^{\mathrm H})-\mu(z_t^{\mathrm{teacher}})\rVert_2^2\\
+  &+
+  \lVert
+    \operatorname{diag}C(z_t^{\mathrm H})
+    -
+    \operatorname{diag}C(z_t^{\mathrm{teacher}})
+  \rVert_2^2\\
+  &+
+  \lVert
+    C(z_t^{\mathrm H})-C(z_t^{\mathrm{teacher}})
+  \rVert_{\mathrm F}^2 .
+\end{split}
+\label{eq:stat-loss}
+\end{equation}
+統計だけを一致させても画像ごとの意味対応は保証されないため，
+\(\mathcal L_{\mathrm{stat}}\) は
+\(\mathcal L_R,\mathcal L_{\mathrm H},\mathcal L_{\mathrm{score}}\) の代替ではなく
+小さい重みの補助項とする．小batchでは共分散推定が不安定なので，
+空間位置を観測として使うか，EMA covarianceを用いる．
+
+\subsection{総loss}
+
+推奨する総lossは
+\begin{equation}
+  \mathcal L
+  =
+  \lambda_{\mathrm{RN}}\mathcal L_{\mathrm{RN}}
+  +
+  \lambda_R\mathcal L_R
+  +
+  \lambda_{\mathrm H}\mathcal L_{\mathrm H}
+  +
+  \lambda_{\mathrm{score}}\mathcal L_{\mathrm{score}}
+  +
+  \lambda_{\mathrm{stat}}\mathcal L_{\mathrm{stat}}
+  +
+  \lambda_{\mathrm{img}}\mathcal L_{\mathrm{img}} .
+\label{eq:total-loss}
+\end{equation}
+\(\mathcal L_{\mathrm{img}}\) は任意であり，凍結VAE decoderを介した
+\(L_1+\)LPIPS等とする．VAE decoderも重みは凍結するが，
+このlossを用いる場合は入力latentへのgradientを切らない．
+
+段階導入時の初期値として
+\[
+  \lambda_{\mathrm{RN}}=1,\quad
+  \lambda_R=1,\quad
+  \lambda_{\mathrm H}=1,\quad
+  \lambda_{\mathrm{score}}=0
+\]
+から始め，latent復元が安定した後に
+\(\lambda_{\mathrm{score}}\) を徐々に上げる．
+\(\lambda_{\mathrm{stat}}\) と \(\lambda_{\mathrm{img}}\) は0からablationで追加する．
+各lossの絶対scaleが異なるため，数値は固定の結論ではなくvalidationで調整する．
+
+\subsection{別scheduleを使う場合の安全なbridge}
+
+公式Resfusion実装\cite{resfusion-code}のように短い独自schedule
+（例：\(T=12\)，実質約5復元step）を
+使う場合，その時刻indexをStable Diffusionのraw timestepとして渡してはならない．
+Resfusionからclean latent推定 \(\tilde z_{0,\theta}\) を得て，
+Stable Diffusionのhandover raw timestep \(\tau\) へ
+\begin{equation}
+  z_\tau^{\mathrm H}
+  =
+  \sqrt{\bar\alpha_\tau^{\mathrm{SD}}}
+  \tilde z_{0,\theta}
+  +
+  \sqrt{1-\bar\alpha_\tau^{\mathrm{SD}}}
+  \epsilon_{\mathrm H},
+  \qquad
+  \epsilon_{\mathrm H}\sim\N(0,I)
+\label{eq:renoise-bridge}
+\end{equation}
+と明示的にre-noiseする．
+この方式は時計の混同を防げる一方，新しいnoiseにより受信細部を失いやすい．
+まず式\eqref{eq:bridge}の共有schedule方式を正しさのbaselineとし，
+速度が必要になった段階で式\eqref{eq:renoise-bridge}を比較する．
+
+\section{Latent Resfusionのnetwork設計}
+
+\subsection{入出力}
+
+公式RDDM U-NetはRGBの3チャネルを前提にしている．本システムでは
+\[
+  v_t\in\R^{B\times4\times32\times32},\qquad
+  \hat z_0\in\R^{B\times4\times32\times32}
+\]
+をchannel方向に結合するため，最初のconvolutionは8入力チャネルとする．
+共有backboneから
+\[
+  \eta_\theta\in\R^{B\times4\times32\times32},
+  \qquad
+  \hat R_\theta\in\R^{B\times4\times32\times32}
+\]
+を出すtwo-head構成，または8出力チャネルを4+4へ分割する構成にする．
+SNR \(\gamma\) はsinusoidal/MLP embedding後に各ResBlockへFiLMで注入する．
+
+重要な差分は次のとおりである．
+\begin{itemize}
+  \item RGB用の \([0,1]\to[-1,1]\) 変換をlatentへ適用しない．
+  \item scaled VAE latentは非有界なので \([-1,1]\) clampをしない．
+  \item official RGB checkpointのfirst/last convolutionだけを変更して
+        そのまま転用することを前提にしない．domainが異なるため，まずlatent pairで学習する．
+  \item time embeddingにはDDIMのstep番号ではなくStable Diffusionの
+        raw timestep \(t\in[0,999]\) を渡す．
+\end{itemize}
+
+\subsection{handover範囲の学習}
+
+Resfusion開始点を \(t_\star=520\) とし，handover候補を
+\[
+  t_{\mathrm H}\in\{500,250,100\}
+\]
+から検証する．学習では
+\[
+  t\sim\mathcal U\{t_{\mathrm H},\ldots,t_\star\}
+\]
+を基本とし，handover lossは候補時刻で重点的に計算する．
+\(t_{\mathrm H}=500\) はStable Diffusionへ早く渡すがADJSCC情報の補正量が小さく，
+\(t_{\mathrm H}=100\) はResfusionが長く復元を担当する．
+最適時刻はSNR依存の可能性があるため，将来は
+\[
+  t_{\mathrm H}=h(\gamma,\text{uncertainty})
+\]
+とするadaptive handoverも検討する．ただし，最初は固定時刻で因果を切り分ける．
+
+\section{学習手順}
+
+\subsection{dataset pairの生成}
+
+各mini-batchで次を行う．
+\begin{enumerate}
+  \item 画像 \(x\) を凍結VAE encoderへ通し，scaled latent \(z_0\) を一度だけ作る．
+  \item SNR \(\gamma\) をsampleし，凍結ADJSCC encoder，fresh channel noise，
+        凍結ADJSCC decoderを通して \(\hat z_0\) を作る．
+  \item \(R=\hat z_0-z_0\) を教師として保持する．
+  \item raw timestep \(t\) と \(\epsilon\sim\N(0,I)\) をsampleする．
+  \item 同一の \(\epsilon\) でResfusion state \(v_t\) と
+        Stable Diffusion教師state \(z_t^{\mathrm{teacher}}\) を作る．
+  \item networkから \(\eta_\theta,\hat R_\theta\) を得て，式
+        \eqref{eq:total-loss}を計算する．
+\end{enumerate}
+pairを事前保存する方法よりonline channel simulationを優先する．
+これにより同一画像に対してSNR/noise realizationを増やせる．
+一方，validationでは画像split，SNR，channel noise seed，diffusion noise seedを
+固定し，全モデルを同一条件で比較する．
+
+\subsection{段階的training}
+
+\paragraph{Phase 0：式とscaleのunit test}
+network学習前に，真の \(R\) を式\eqref{eq:bridge}へ入れたとき
+\(z_t^{\mathrm H}=z_t^{\mathrm{teacher}}\) が数値誤差内で成立することを確認する．
+さらに \(t_\star=520\)，shape，dtype，VAE scale，raw timestepをtestする．
+
+\paragraph{Phase 1：Resfusion本体}
+VAE，ADJSCC，Stable Diffusionを凍結し，
+\(\mathcal L_{\mathrm{RN}}+\mathcal L_R+\mathcal L_{\mathrm H}\) で
+Latent Resfusionだけを学習する．
+optimizerは原論文に合わせてAdamWを出発点とし，
+learning rate \(1.1\times10^{-4}\) を候補にするが，
+latent U-Netのbatch sizeに合わせてvalidationで調整する．
+
+\paragraph{Phase 2：Stable Diffusion interface alignment}
+Phase 1 checkpointから開始し，
+\(\mathcal L_{\mathrm{score}}\) を追加する．
+最初はhandover近傍のraw timestepだけで計算し，GPU memoryが許せば範囲を広げる．
+SD U-Netはeval modeかつ凍結する．ただしstudent branchのinput gradientは保持する．
+通常のdiffusion trainingは真のforward state \(v_t\) を入力する一方，推論時は
+model自身が生成したreverse stateを使う．この差を検査するため，Phase 2後半では
+\(t_\star\) から \(t_{\mathrm H}\) まで短くrolloutしたstate上でも
+handover/score lossを測る．まずrolloutをdetachした安定な学習を行い，必要なら
+truncated backpropagationへ進む．
+
+\paragraph{Phase 3：任意のjoint fine-tuning}
+Phase 2がbaselineを上回った後に限り，ADJSCC decoderを小さいlearning rateで
+同時更新する．encoder，VAE，SD U-Netは当面凍結する．
+最初からend-to-end更新すると，どのmoduleが分布を直したか判別できず，
+SD priorへ過適合する危険がある．
+
+\subsection{推奨するbatch内sampling}
+
+\begin{itemize}
+  \item SNRは \(\{-10,-5,0,5,10,20\}\) dBの離散一様，または
+        \([-10,20]\) dBの連続一様を比較する．
+  \item 低SNRが難しすぎる場合はcurriculumとして
+        \(20\to10\to0\to-10\) dBへ範囲を広げる．
+  \item timestepは一様sampleをbaselineとし，handover近傍を50\%，
+        その他を50\%とするimportance samplingを比較する．
+  \item text conditionはまずempty promptに固定する．
+  \item mixed precision使用時も \(\bar\alpha_t\)，covariance，
+        loss集計はfloat32以上で行う．
+\end{itemize}
+
+\section{推論手順}
+
+\subsection{共有schedule・明示bridge方式}
+
+入力 \(\hat z_0\)，channel SNR \(\gamma\)，handover時刻 \(t_{\mathrm H}\) に対し，
+推論は次の順序で行う．
+\begin{enumerate}
+  \item \(\epsilon\sim\N(0,I)\) をsampleし，式\eqref{eq:resfusion-init}で
+        \(v_{t_\star}\) を初期化する．
+  \item Resfusion samplerで \(t_\star\) から \(t_{\mathrm H}\) まで逆向きに更新する．
+  \item handover点で \(\hat R_\theta\) を推定し，式\eqref{eq:bridge}で
+        \(z^{\mathrm H}_{t_{\mathrm H}}\) を作る．
+  \item Stable Diffusion samplerへ
+        \((z^{\mathrm H}_{t_{\mathrm H}},t_{\mathrm H},c)\) を渡し，
+        raw timestep \(t_{\mathrm H}\) から0まで逆拡散する．
+  \item 得られた \(\tilde z_0\) をscale済みlatentとしてVAE decoderへ渡す．
+\end{enumerate}
+
+DDIM\cite{ddim}/PLMSでstepを間引く場合も，scheduler配列の位置とraw timestepを区別する．
+両modelへ渡すtime embedding，\(\bar\alpha_t\)，handover indexは同じraw \(t\) を
+参照しなければならない．まず連続DDPM stepで数式の正しさを確認し，
+次に共通のDDIM gridへ置き換えて速度を評価する．
+
+\subsection{疑似コード}
+
+\begin{verbatim}
+z0      = vae_encode_scaled(image)          # teacher, training only
+z_hat0  = adjscc_decode(channel(adjscc_encode(z0), snr))
+
+# inference begins with received latent z_hat0
+v = sqrt(alpha_bar[t_star]) * z_hat0 \
+    + sqrt(1 - alpha_bar[t_star]) * randn_like(z_hat0)
+
+for t in resfusion_grid(t_star, t_handover):
+    eta_hat, r_hat = latent_resfusion(v, z_hat0, t, snr)
+    v = resfusion_reverse_step(v, eta_hat, t)
+
+eta_hat, r_hat = latent_resfusion(v, z_hat0, t_handover, snr)
+z_handover = v - (1 - sqrt(alpha_bar[t_handover])) * r_hat
+
+z_out = stable_diffusion_reverse(
+    z_handover, start_raw_timestep=t_handover,
+    condition=empty_prompt, guidance_scale=1.0
+)
+image_out = vae_decode_scaled(z_out)
+\end{verbatim}
+
+\section{評価計画}
+
+\subsection{比較系}
+
+\begin{enumerate}
+  \item \textbf{ADJSCC only}: \(\hat z_0\) を直接VAE decodeする．
+  \item \textbf{SD only}: 通常forward diffusionした \(\hat z_0\) からSDで復元する．
+  \item \textbf{full Resfusion}: handoverせずResfusionだけで \(t=0\) まで復元する．
+  \item \textbf{direct handover}: bridgeなしで \(v_{t_{\mathrm H}}\) をSDへ渡す．
+  \item \textbf{bridge handover}: 式\eqref{eq:bridge}を用いる提案法．
+  \item \textbf{bridge + score}: さらに \(\mathcal L_{\mathrm{score}}\) を用いる．
+  \item \textbf{bridge + score + stat}: 全補助lossを用いる．
+\end{enumerate}
+direct handoverは式\eqref{eq:handover-gap}の影響を実証する重要なablationである．
+
+\subsection{測定量}
+
+\paragraph{latent fidelity}
+\[
+  \mse(\tilde z_0,z_0),\qquad
+  \operatorname{NMSE}
+  =
+  \frac{\lVert\tilde z_0-z_0\rVert_2^2}
+       {\lVert z_0\rVert_2^2}.
+\]
+global/channel mean，std，RMS，min/max，4\(\times\)4 covariance，
+共分散固有値，\(r_{\mathrm{eff}}\) も既存scriptと同じ定義で再測定する．
+
+\paragraph{handover alignment}
+\[
+  \E\lVert z_t^{\mathrm H}-z_t^{\mathrm{teacher}}\rVert_2^2,\qquad
+  e_{\mathrm{cov}},\qquad
+  \E\left\lVert
+    \epsilon_\psi^{\mathrm{SD}}(z_t^{\mathrm H},t,c)
+    -
+    \epsilon_\psi^{\mathrm{SD}}(z_t^{\mathrm{teacher}},t,c)
+  \right\rVert_2^2 .
+\]
+最後の量を「score gap」と呼び，本研究の仮説に最も直接対応する指標とする．
+
+\paragraph{image fidelity/perception}
+PSNR，SSIM，LPIPSに加え，顔datasetではidentity similarityを測る．
+FIDだけでは入力との対応を失ったhallucinationを見逃すため，
+paired metricと目視比較を必ず併用する．
+
+\paragraph{通信・計算量}
+各SNRに対する性能，Resfusion step数，SD step数，総latency，
+peak VRAM，parameter数を報告する．
+
+\subsection{主要ablation}
+
+\begin{itemize}
+  \item \(t_{\mathrm H}\in\{500,250,100\}\)
+  \item shared schedule bridge と short-schedule re-noise bridge
+  \item residual headあり/なし
+  \item \(\mathcal L_{\mathrm H}\)，\(\mathcal L_{\mathrm{score}}\)，
+        \(\mathcal L_{\mathrm{stat}}\) の有無
+  \item SNR conditioningあり/なし
+  \item fixed SNR学習とmixed SNR学習
+  \item stochastic DDPMとdeterministic DDIM
+  \item empty prompt，guidance scale 1と通常CFG
+\end{itemize}
+
+\section{成功条件と失敗の切り分け}
+
+\subsection{段階ごとの成功条件}
+
+\begin{enumerate}
+  \item \textbf{bridgeの代数検証}: 真の \(R\) ならhandover MSEが浮動小数点誤差になる．
+  \item \textbf{分布補正}: 推定 \(\hat R_\theta\) でも
+        global/channel統計とcovariance errorがADJSCC baselineより改善する．
+  \item \textbf{U-Net整合}: score gapがdirect handoverより有意に小さくなる．
+  \item \textbf{復元改善}: paired image metricとidentityを保ったままartifactが減る．
+  \item \textbf{SNR頑健性}: 未知または中間SNRでも性能が急落しない．
+\end{enumerate}
+
+\subsection{想定される失敗と診断}
+
+\begin{table}[htbp]
+  \small
+  \centering
+  \begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{.28\linewidth}X}
+    \toprule
+    症状 & 主な確認事項 \\
+    \midrule
+    統計は合うがidentityが変わる &
+      moment lossが強すぎる，handover \(t\) が高すぎる，
+      CFGが強すぎる，sample alignment loss不足．\\
+    latent MSEは下がるがartifactが残る &
+      SD U-Netのscore gap，text condition，sampler timestepのずれを確認する．\\
+    score lossが学習されない &
+      student側U-Net forwardをno-gradにしていないか，
+      \(z_t^{\mathrm H}\) をdetachしていないか確認する．\\
+    SNRごとに性能が大きく変わる &
+      SNR embedding，channel noise variance，power normalization，
+      train/test SNR定義を確認する．\\
+    出力が飽和する &
+      latentへRGB用clampや \([-1,1]\) mappingを適用していないか確認する．\\
+    handover直後に品質が崩れる &
+      ResfusionとSDのschedule，raw timestep，\(\bar\alpha_t\)，
+      prediction parameterization（epsilon/v）を確認する．\\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\section{実装へ落とす際の変更点}
+
+公式実装を参照しつつ，少なくとも以下を別moduleとして実装する．
+\begin{itemize}
+  \item \textbf{latent distribution}: 
+        \path{Resfusion/model/distributions.py} の式を4-channel latentへ適用する．
+  \item \textbf{network}: 
+        \path{Resfusion/model/denoising_module/RDDM/RDDM_model.py} の
+        inputを8チャネル，outputを8チャネルにし，SNR conditioningを加える．
+  \item \textbf{training}: 
+        \path{Resfusion/model/resfusion_restore.py} のRGB mapping，clamp，RGB PSNRを除き，
+        bridge/score/stat lossesを追加する．
+  \item \textbf{scheduler}: 
+        最初はStable Diffusion modelに登録済みの
+        \(\alpha_t,\bar\alpha_t,\beta_t\) を唯一のsource of truthとして使う．
+  \item \textbf{handover sampler}: 
+        raw timestepを明示して既存DDIM/PLMS samplerへ途中stateを渡すadapterを作る．
+\end{itemize}
+
+checkpointにはResfusion重みだけでなく，
+VAE/ADJSCC/SD checkpoint hash，schedule設定，VAE scale，
+SNR sampling範囲，\(t_\star,t_{\mathrm H}\)，prediction typeを保存する．
+
+\section{研究上の注意}
+
+\begin{itemize}
+  \item Resfusion原論文\cite{resfusion}の実験はRGB restorationであり，論文自身もlatent-space
+        extensionを将来課題としている．本メモのlatent版，two-head bridge，
+        SD score distillationは新規設計であり，原論文の主張として扱わない．
+  \item forward diffusion後にglobal statisticsがGaussianへ近づくことだけでは，
+        U-Netのtraining distributionへsample-conditionally戻ったとは言えない．
+        score gapとpaired復元性能で確認する．
+  \item Stable DiffusionがFFHQ専用priorではない場合，SD側のdomain gapも混在する．
+        clean \(z_t\) を入力したoracle SD復元を上限比較として必ず置く．
+  \item Resfusion repository\cite{resfusion-code}はCC BY-NC-SA 4.0を掲示しているため，
+        code再利用・配布時にはlicense条件を確認する．
+\end{itemize}
+
+\section{最小実験の実行順}
+
+\begin{enumerate}
+  \item 真の \(R\) を使うoracle bridgeを実装し，式
+        \eqref{eq:bridge}とSD途中開始が正しいことを100画像で確認する．
+  \item \(t_{\mathrm H}=500,250,100\) のoracle score gapと復元品質を比較し，
+        handover候補を1つに絞る．
+  \item two-head Latent Resfusionを
+        \(\mathcal L_{\mathrm{RN}}+\mathcal L_R+\mathcal L_{\mathrm H}\) で学習する．
+  \item direct handoverとbridge handoverを1000画像・全SNRで比較する．
+  \item \(\mathcal L_{\mathrm{score}}\) を追加し，score gapとartifactの因果を確認する．
+  \item その後にのみstat loss，image loss，DDIM acceleration，
+        ADJSCC decoder joint tuningを追加する．
+\end{enumerate}
+この順序なら，「Resfusionが効いた」という一括評価ではなく，
+分布補正，U-Net整合，画像改善のどの段階で効果が生じたかを切り分けられる．
+
+\begin{thebibliography}{9}
+
+\bibitem{resfusion}
+Y. Liu et al.,
+\newblock ``Resfusion: Prior Residual Noise Embedded Denoising Diffusion
+  Probabilistic Models for Image Restoration,''
+\newblock \emph{NeurIPS 2024}.
+\newblock \url{https://arxiv.org/abs/2311.14900}
+
+\bibitem{ddpm}
+J. Ho, A. Jain, and P. Abbeel,
+\newblock ``Denoising Diffusion Probabilistic Models,''
+\newblock \emph{NeurIPS 2020}.
+\newblock \url{https://arxiv.org/abs/2006.11239}
+
+\bibitem{ddim}
+J. Song, C. Meng, and S. Ermon,
+\newblock ``Denoising Diffusion Implicit Models,''
+\newblock \emph{ICLR 2021}.
+\newblock \url{https://arxiv.org/abs/2010.02502}
+
+\bibitem{ldm}
+R. Rombach et al.,
+\newblock ``High-Resolution Image Synthesis with Latent Diffusion Models,''
+\newblock \emph{CVPR 2022}.
+\newblock \url{https://arxiv.org/abs/2112.10752}
+
+\bibitem{resfusion-code}
+NKICSL,
+\newblock ``Official implementation of Resfusion.''
+\newblock \url{https://github.com/nkicsl/Resfusion}
+
+\end{thebibliography}
+
+\end{document}
