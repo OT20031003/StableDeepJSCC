@@ -501,8 +501,8 @@ python ADJSCC/adjscc_sd_img2img.py \
   --init-img ../datasets/ffhq_train_70k/00000.png \
   --prompt "" \
   --negative-prompt "" \
-  --output-dir ADJSCC/outputs/sd_adjscc_img2img/snr_20_strength_035 \
-  --adjscc-checkpoint ADJSCC/outputs/sd_vae_ffhq_stage2/last.pt \
+  --output-dir ADJSCC/outputs/sd_adjscc_img2img/snr_20_strength_035_C32 \
+  --adjscc-checkpoint ADJSCC/outputs/sd_vae_ffhq_stage1_C32/last.pt \
   --sd-config configs/stable-diffusion/v1-inference.yaml \
   --sd-checkpoint models/ldm/stable-diffusion-v1/model.ckpt \
   --image-size 256 \

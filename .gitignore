@@ -1,3 +1,4 @@
 *.ckpt
 outputs
 *pycache*
+src/taming-transformers 
