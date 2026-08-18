@@ -13,10 +13,14 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from infer_latent_resfusion_handover import (
     ImageMetricEvaluator,
+    aggregate_image_metrics,
     average_metric_records,
     build_parser as build_inference_parser,
     decode_from_raw_timestep,
+    image_output_directories,
     raw_timestep_to_t_start,
+    repeat_latents_for_samples,
+    resolve_input_images,
     validate_args as validate_inference_args,
 )
 from latent_resfusion import (
@@ -216,6 +220,85 @@ class LatentResfusionModelTests(unittest.TestCase):
 
 
 class DirectHandoverCLITests(unittest.TestCase):
+    @staticmethod
+    def _metrics(value):
+        return {
+            "psnr_db": float(value),
+            "lpips": float(value),
+            "dists": float(value),
+            "ms_ssim": float(value),
+        }
+
+    def test_directory_inputs_are_recursive_and_get_per_image_output_dirs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "inputs"
+            nested = root / "nested"
+            nested.mkdir(parents=True)
+            first = root / "face.png"
+            second = nested / "other.jpg"
+            ignored = root / "notes.txt"
+            first.touch()
+            second.touch()
+            ignored.touch()
+
+            source, paths, is_directory = resolve_input_images(str(root))
+            self.assertTrue(is_directory)
+            self.assertEqual(paths, [first.resolve(), second.resolve()])
+            output_root = Path(directory) / "outputs"
+            output_dirs = image_output_directories(
+                source, paths, output_root, is_directory
+            )
+            self.assertEqual(
+                output_dirs,
+                [output_root / "face", output_root / "nested" / "other"],
+            )
+
+    def test_batched_sample_expansion_keeps_each_input_contiguous(self):
+        latents = torch.tensor([1.0, 2.0]).reshape(2, 1, 1, 1)
+        expanded = repeat_latents_for_samples(latents, 3)
+        self.assertEqual(
+            expanded.flatten().tolist(), [1.0, 1.0, 1.0, 2.0, 2.0, 2.0]
+        )
+
+    def test_dataset_metrics_are_averaged_by_handover_stage(self):
+        image_results = []
+        for offset in (0.0, 2.0):
+            image_results.append(
+                {
+                    "adjscc_received": {"metrics": self._metrics(1 + offset)},
+                    "handover_results": [
+                        {
+                            "completed_resfusion_steps": 5,
+                            "sd_raw_timestep": 0,
+                            "resfusion_state_decode": {
+                                "metrics": self._metrics(3 + offset)
+                            },
+                            "samples": [
+                                {"metrics": self._metrics(5 + offset)},
+                                {"metrics": self._metrics(7 + offset)},
+                            ],
+                        }
+                    ],
+                }
+            )
+
+        aggregate = aggregate_image_metrics(image_results)
+        self.assertEqual(aggregate["image_count"], 2)
+        self.assertEqual(aggregate["adjscc_received"]["count"], 2)
+        self.assertAlmostEqual(
+            aggregate["adjscc_received"]["mean"]["psnr_db"], 2.0
+        )
+        stage = aggregate["handover_results"][0]
+        self.assertEqual(stage["completed_resfusion_steps"], 5)
+        self.assertEqual(stage["resfusion_state_decode"]["count"], 2)
+        self.assertAlmostEqual(
+            stage["resfusion_state_decode"]["mean"]["lpips"], 4.0
+        )
+        self.assertEqual(stage["stable_diffusion_samples"]["count"], 4)
+        self.assertAlmostEqual(
+            stage["stable_diffusion_samples"]["mean"]["ms_ssim"], 7.0
+        )
+
     def test_image_metrics_compare_displayed_rgb_tensors_to_ground_truth(self):
         class MeanAbsoluteDifference(torch.nn.Module):
             def forward(self, image, ground_truth):
@@ -333,6 +416,8 @@ class DirectHandoverCLITests(unittest.TestCase):
         validate_inference_args(inference)
         self.assertEqual(inference.handover_step, 3)
         self.assertEqual(inference.guidance_scale, 1.0)
+        self.assertEqual(inference.batch_size, 1)
+        self.assertEqual(inference.num_workers, 0)
         self.assertEqual(inference.dim_mults, (1, 2, 4, 8))
 
 

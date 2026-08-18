@@ -252,37 +252,45 @@ python ADJSCC/infer_latent_resfusion_handover.py \
 
 ```bash
 python ADJSCC/infer_latent_resfusion_handover.py \
-  --init-img ADJSCC/outputs/sd_adjscc_img2img/snr_20_strength_035_C32/input.png \
+  --input-dir /mnt/d/datasets/ffhq_val \
   --adjscc-checkpoint ADJSCC/outputs/sd_vae_ffhq_stage1_C32/best.pt \
   --resfusion-checkpoint ADJSCC/outputs/latent_resfusion_5step_C32/best.pt \
   --output-dir ADJSCC/outputs/resfusion_handover_all \
   --snr-db 0 \
   --all-handover-steps \
+  --batch-size 2 \
   --guidance-scale 1 \
   --ddim-eta 0 \
   --device cuda
 ```
 
-各handover状態からStable Diffusionを独立に実行するため、全段階ではSD U-Netを合計 `521+476+310+147+10+1=1465` 回呼ぶ。特に `k=0` はraw timestep 520から開始するため、Resfusion自体は0回でもStable Diffusion側は521回であり、短時間の推論ではない。
+`--input-dir`（`--init-img` の別名）へdirectoryを渡すと、配下の対応画像を再帰的に探索する。モデルは一度だけロードし、`--batch-size` 件ずつまとめてVAE、ADJSCC、Resfusion、Stable Diffusionを実行する。画像fileを渡す従来の単体実行にも対応する。
+
+各handover状態からStable Diffusionを独立に実行するため、1 batchあたり全段階ではSD U-Netを合計 `521+476+310+147+10+1=1465` 回呼ぶ。特に `k=0` はraw timestep 520から開始するため、Resfusion自体は0回でもStable Diffusion側は521回であり、短時間の推論ではない。
 
 ### 6.3 推論出力
 
-推論先には次を保存する。
+directory入力時は、入力directoryからの相対path（拡張子なし）を各画像の出力directoryとして保持し、次を保存する。
 
 ```text
-input.png
-adjscc_received.png
-summary_grid.png
-metrics.json
-metadata.json
-handover_k{K}_sd_t{TAU}/
-  resfusion_state.png
-  sample_000.png
-  comparison_grid.png
+aggregate_metrics.json
+batch_metadata.json
+{relative/input/image/stem}/
+  input.png
+  adjscc_received.png
+  summary_grid.png
   metrics.json
+  metadata.json
+  handover_k{K}_sd_t{TAU}/
+    resfusion_state.png
+    sample_000.png
+    comparison_grid.png
+    metrics.json
 ```
 
-各 `comparison_grid.png` は上からGT、ADJSCC受信画像、Resfusion state decode、Stable Diffusion sampleの順である。同じディレクトリの `metrics.json` にはGT以外の各画像をGTと比較したPSNR、LPIPS、DISTS、MS-SSIMを行・列との対応付きで記録する。複数sampleの場合は各sampleの値と平均値を保存する。出力rootの `metrics.json` は全handover段階の集約である。PSNRとMS-SSIMは表示用RGB `[0,1]`（data range 1）、LPIPSはAlexNet版を使用する。
+各 `comparison_grid.png` は上からGT、ADJSCC受信画像、Resfusion state decode、Stable Diffusion sampleの順である。同じディレクトリの `metrics.json` にはGT以外の各画像をGTと比較したPSNR、LPIPS、DISTS、MS-SSIMを行・列との対応付きで記録する。複数sampleの場合は各sampleの値と平均値を保存する。各画像の出力directory直下にある `metrics.json` は、その画像の全handover段階を集約する。PSNRとMS-SSIMは表示用RGB `[0,1]`（data range 1）、LPIPSはAlexNet版を使用する。
+
+directory入力ではrootの `aggregate_metrics.json` に、全入力画像のADJSCC受信画像平均と、各handover段階におけるResfusion state decode平均およびStable Diffusion sample平均を記録する。`--num-samples` が2以上の場合、後者は全画像・全sampleを対象とする。`batch_metadata.json` には入力画像と各出力directoryの対応を記録する。
 
 `metadata.json` には実行引数、checkpoint情報、実際に計算した6段階のtimestep mapping、選択段階、出力path、および各metrics fileへのpathを記録する。
 
@@ -303,7 +311,7 @@ conda run -n ldm python ADJSCC/train_latent_resfusion.py --help
 conda run -n ldm python ADJSCC/infer_latent_resfusion_handover.py --help
 ```
 
-結果はADJSCC全体で32 tests passedである。新規テストでは特に次を確認した。
+結果はADJSCC全体で35 tests passedである。新規テストでは特に次を確認した。
 
 - T=12 LinearPro scheduleが5 stepへ切られること
 - forward stateとresidual-noise targetが `easy.tex` の閉形式に一致すること
@@ -317,5 +325,8 @@ conda run -n ldm python ADJSCC/infer_latent_resfusion_handover.py --help
 - synthetic 1 epochでResfusion U-Netだけを更新できること
 - 学習CLIと推論CLIが分離されていること
 - 4画質指標が表示用RGB tensorをGTと比較し、複数sampleの平均にも4指標すべてが含まれること
+- directory入力を再帰探索し、入力ごとに重複しない出力directoryを割り当てること
+- batched handoverで各入力のsampleが連続し、入力との対応を維持すること
+- 全入力の4画質指標をhandover段階別に平均すること
 
-検証環境ではCUDA deviceを利用できなかったため、実checkpointを使ったGPU学習と全Stable Diffusion推論は実行していない。数式・model forward/backward・checkpoint・CLI・既存ADJSCCとの回帰テストまではCPUで確認済みである。
+実checkpointとRTX 3060を使い、3画像を `--batch-size 2 --handover-step 5` で処理するGPUスモークテストを実行した。画像別の全出力、画像別metrics、`batch_metadata.json`、handover段階別平均を含む `aggregate_metrics.json` の生成まで確認済みである。計算量が大きい0～5全段階の再実行とGPU学習は、このスモークテストには含めていない。

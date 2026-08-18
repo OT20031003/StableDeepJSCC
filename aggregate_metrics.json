@@ -1,0 +1,155 @@
+{
+  "reference_scope": "each output is compared with its own input GT",
+  "image_count": 8,
+  "definitions": {
+    "psnr_db": "PSNR on RGB [0, 1] tensors with data_range=1.0",
+    "lpips": "LPIPS v0.1 with the AlexNet backbone; lower is better",
+    "dists": "DISTS with its learned alpha/beta weights; lower is better",
+    "ms_ssim": "five-scale MS-SSIM with the standard weights and data_range=1.0; higher is better"
+  },
+  "adjscc_received": {
+    "count": 8,
+    "mean": {
+      "psnr_db": 19.77659280166956,
+      "lpips": 0.43002092465758324,
+      "dists": 0.3654855638742447,
+      "ms_ssim": 0.7263981029391289
+    }
+  },
+  "handover_results": [
+    {
+      "completed_resfusion_steps": 0,
+      "sd_raw_timestep": 520,
+      "resfusion_state_decode": {
+        "count": 8,
+        "mean": {
+          "psnr_db": 9.634228458928375,
+          "lpips": 0.7295834347605705,
+          "dists": 0.4437648430466652,
+          "ms_ssim": 0.1476175645366311
+        }
+      },
+      "stable_diffusion_samples": {
+        "count": 8,
+        "mean": {
+          "psnr_db": 12.916457158175822,
+          "lpips": 0.594449907541275,
+          "dists": 0.3638679012656212,
+          "ms_ssim": 0.325400996953249
+        }
+      }
+    },
+    {
+      "completed_resfusion_steps": 1,
+      "sd_raw_timestep": 475,
+      "resfusion_state_decode": {
+        "count": 8,
+        "mean": {
+          "psnr_db": 10.161004990248236,
+          "lpips": 0.7162912040948868,
+          "dists": 0.433247871696949,
+          "ms_ssim": 0.17275932431221008
+        }
+      },
+      "stable_diffusion_samples": {
+        "count": 8,
+        "mean": {
+          "psnr_db": 13.79323800475417,
+          "lpips": 0.5764160975813866,
+          "dists": 0.3510916382074356,
+          "ms_ssim": 0.3695936221629381
+        }
+      }
+    },
+    {
+      "completed_resfusion_steps": 2,
+      "sd_raw_timestep": 309,
+      "resfusion_state_decode": {
+        "count": 8,
+        "mean": {
+          "psnr_db": 12.87706535093033,
+          "lpips": 0.6371302455663681,
+          "dists": 0.38164379447698593,
+          "ms_ssim": 0.3014272712171078
+        }
+      },
+      "stable_diffusion_samples": {
+        "count": 8,
+        "mean": {
+          "psnr_db": 16.737753353294696,
+          "lpips": 0.4448269307613373,
+          "dists": 0.29619333893060684,
+          "ms_ssim": 0.5444691926240921
+        }
+      }
+    },
+    {
+      "completed_resfusion_steps": 3,
+      "sd_raw_timestep": 146,
+      "resfusion_state_decode": {
+        "count": 8,
+        "mean": {
+          "psnr_db": 17.18696463529619,
+          "lpips": 0.4557955674827099,
+          "dists": 0.32161296159029007,
+          "ms_ssim": 0.549662359058857
+        }
+      },
+      "stable_diffusion_samples": {
+        "count": 8,
+        "mean": {
+          "psnr_db": 18.50687406659056,
+          "lpips": 0.3441293127834797,
+          "dists": 0.2459203004837036,
+          "ms_ssim": 0.6580352261662483
+        }
+      }
+    },
+    {
+      "completed_resfusion_steps": 4,
+      "sd_raw_timestep": 9,
+      "resfusion_state_decode": {
+        "count": 8,
+        "mean": {
+          "psnr_db": 19.340646005684107,
+          "lpips": 0.3218924552202225,
+          "dists": 0.2556980550289154,
+          "ms_ssim": 0.7153363451361656
+        }
+      },
+      "stable_diffusion_samples": {
+        "count": 8,
+        "mean": {
+          "psnr_db": 19.36138109136429,
+          "lpips": 0.32762403413653374,
+          "dists": 0.26040638238191605,
+          "ms_ssim": 0.7174045369029045
+        }
+      }
+    },
+    {
+      "completed_resfusion_steps": 5,
+      "sd_raw_timestep": 0,
+      "resfusion_state_decode": {
+        "count": 8,
+        "mean": {
+          "psnr_db": 19.391004303880724,
+          "lpips": 0.3284014165401459,
+          "dists": 0.2628408744931221,
+          "ms_ssim": 0.7201044857501984
+        }
+      },
+      "stable_diffusion_samples": {
+        "count": 8,
+        "mean": {
+          "psnr_db": 19.39272102442547,
+          "lpips": 0.32962274365127087,
+          "dists": 0.26451149582862854,
+          "ms_ssim": 0.72030109167099
+        }
+      }
+    }
+  ],
+  "input_directory": "/mnt/d/datasets/ffhq_val",
+  "num_samples_per_image": 1
+}

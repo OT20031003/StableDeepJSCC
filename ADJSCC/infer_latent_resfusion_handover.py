@@ -1,10 +1,10 @@
-"""Directly hand any 0--5 step latent Resfusion state to Stable Diffusion."""
+"""Run direct latent Resfusion handover for one image or an image directory."""
 
 import argparse
 import gc
 import math
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor
@@ -17,11 +17,11 @@ from adjscc_sd_img2img import (
     DEFAULT_SD_CONFIG,
     DeviceAwareDDIMSampler,
     load_adjscc,
-    load_init_image,
     load_stable_diffusion,
     precision_scope,
     to_display_range,
 )
+from adjscc_sd_vae_ffhq import FFHQDataset, IMAGE_EXTENSIONS, discover_images
 from latent_resfusion import (
     RESFUSION_REVERSE_STEPS,
     FiveStepResfusionSchedule,
@@ -31,6 +31,7 @@ from latent_resfusion import (
     timestep_mapping_records,
 )
 from training import (
+    make_loader,
     mse_to_psnr,
     resolve_device,
     save_image,
@@ -224,6 +225,129 @@ def print_metric_record(label: str, metrics: Dict[str, float]) -> None:
     )
 
 
+def resolve_input_images(
+    input_path: str,
+) -> Tuple[Path, List[Path], bool]:
+    """Resolve a supported image file or all supported images below a folder."""
+
+    source = Path(input_path).resolve()
+    if source.is_file():
+        if source.suffix.lower() not in IMAGE_EXTENSIONS:
+            raise ValueError(
+                "unsupported input image extension: {}".format(source.suffix)
+            )
+        return source, [source], False
+    if source.is_dir():
+        return source, [path.resolve() for path in discover_images(str(source))], True
+    raise FileNotFoundError("input image or directory not found: {}".format(source))
+
+
+def image_output_directories(
+    input_source: Path,
+    image_paths: Sequence[Path],
+    output_root: Path,
+    directory_input: bool,
+) -> List[Path]:
+    """Assign one collision-free output directory to every input image."""
+
+    if not directory_input:
+        return [output_root]
+
+    relative_directories: List[Path] = []
+    used = set()
+    for image_path in image_paths:
+        relative_image = image_path.relative_to(input_source)
+        candidate = relative_image.with_suffix("")
+        candidate_key = candidate.as_posix().casefold()
+        if candidate_key in used:
+            extension = relative_image.suffix.lower().lstrip(".") or "image"
+            candidate = candidate.parent / "{}__{}".format(
+                candidate.name, extension
+            )
+            candidate_key = candidate.as_posix().casefold()
+        suffix_index = 2
+        while candidate_key in used:
+            candidate = candidate.parent / "{}__{:03d}".format(
+                relative_image.stem, suffix_index
+            )
+            candidate_key = candidate.as_posix().casefold()
+            suffix_index += 1
+        used.add(candidate_key)
+        relative_directories.append(output_root / candidate)
+    return relative_directories
+
+
+def aggregate_image_metrics(
+    image_metric_results: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """Average per-image metrics, grouped by handover stage."""
+
+    if not image_metric_results:
+        raise ValueError("cannot aggregate metrics for zero images")
+
+    adjscc_records = [
+        result["adjscc_received"]["metrics"]
+        for result in image_metric_results
+    ]
+    first_stages = image_metric_results[0]["handover_results"]
+    aggregate_stages = []
+    for first_stage in first_stages:
+        completed_steps = int(first_stage["completed_resfusion_steps"])
+        state_records = []
+        sample_records = []
+        for image_result in image_metric_results:
+            stages_by_step = {
+                int(stage["completed_resfusion_steps"]): stage
+                for stage in image_result["handover_results"]
+            }
+            if completed_steps not in stages_by_step:
+                raise ValueError(
+                    "missing handover stage {} in an image result".format(
+                        completed_steps
+                    )
+                )
+            stage = stages_by_step[completed_steps]
+            state_records.append(
+                stage["resfusion_state_decode"]["metrics"]
+            )
+            sample_records.extend(
+                sample["metrics"] for sample in stage["samples"]
+            )
+        aggregate_stages.append(
+            {
+                "completed_resfusion_steps": completed_steps,
+                "sd_raw_timestep": int(first_stage["sd_raw_timestep"]),
+                "resfusion_state_decode": {
+                    "count": len(state_records),
+                    "mean": average_metric_records(state_records),
+                },
+                "stable_diffusion_samples": {
+                    "count": len(sample_records),
+                    "mean": average_metric_records(sample_records),
+                },
+            }
+        )
+
+    return {
+        "reference_scope": "each output is compared with its own input GT",
+        "image_count": len(image_metric_results),
+        "definitions": dict(METRIC_DEFINITIONS),
+        "adjscc_received": {
+            "count": len(adjscc_records),
+            "mean": average_metric_records(adjscc_records),
+        },
+        "handover_results": aggregate_stages,
+    }
+
+
+def repeat_latents_for_samples(latents: Tensor, num_samples: int) -> Tensor:
+    """Keep each input's samples contiguous in a batched SD handover."""
+
+    if num_samples <= 0:
+        raise ValueError("num_samples must be positive")
+    return latents.repeat_interleave(num_samples, dim=0)
+
+
 def raw_timestep_to_t_start(raw_timestep: int, total_timesteps: int = 1000) -> int:
     """Convert an inclusive raw timestep to DDIMSampler.decode's step count."""
 
@@ -295,6 +419,10 @@ def validate_args(args) -> None:
         )
     if args.num_samples <= 0:
         raise ValueError("--num-samples must be positive")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    if args.num_workers < 0:
+        raise ValueError("--num-workers cannot be negative")
     if args.guidance_scale < 0 or not math.isfinite(args.guidance_scale):
         raise ValueError("--guidance-scale must be finite and non-negative")
     if args.ddim_eta < 0 or not math.isfinite(args.ddim_eta):
@@ -304,189 +432,35 @@ def validate_args(args) -> None:
     args.dim_mults = parse_dim_mults(args.dim_mults)
 
 
-@torch.no_grad()
-def run_inference(args) -> Dict[str, object]:
-    validate_args(args)
-    validate_metric_dependencies()
-    seed_everything(args.seed)
-    device = resolve_device(args.device)
-    print("device: {}".format(device))
+def save_single_image_outputs(
+    args,
+    source_image: Path,
+    output_dir: Path,
+    device: torch.device,
+    input_01: Tensor,
+    adjscc_01: Tensor,
+    display_stage_outputs: List[Dict[str, object]],
+    clean_latent_sample_shape: Sequence[int],
+    degraded_latent_sample_shape: Sequence[int],
+    mapping: List[Dict[str, object]],
+    selected_steps: List[int],
+    adjscc_info: Dict[str, object],
+    resfusion_info: Dict[str, object],
+    metric_evaluator: ImageMetricEvaluator,
+) -> Tuple[Dict[str, object], Dict[str, object]]:
+    """Save the former single-image output layout inside one directory."""
 
-    stable_diffusion = load_stable_diffusion(
-        args.sd_config,
-        args.sd_checkpoint,
-        device,
-        verbose=args.verbose_loading,
-    )
-    adjscc, adjscc_info = load_adjscc(
-        args.adjscc_checkpoint,
-        device,
-        args.transmit_channel_num,
-        args.feature_channels,
-    )
-    resfusion, resfusion_payload, resfusion_info = load_latent_resfusion_checkpoint(
-        args.resfusion_checkpoint,
-        device,
-        fallback_dim=args.model_dim,
-        fallback_dim_mults=args.dim_mults,
-        fallback_resnet_groups=args.resnet_block_groups,
-        freeze=True,
-    )
-    del resfusion_payload
-    gc.collect()
-    schedule = FiveStepResfusionSchedule().to(device)
-    mapping = timestep_mapping_records(
-        schedule, stable_diffusion.alphas_cumprod
-    )
-    print(
-        "Direct handover mapping k=0..5 -> SD raw timestep: {}".format(
-            [record["sd_raw_timestep"] for record in mapping]
-        )
-    )
-
-    selected_steps = (
-        list(range(RESFUSION_REVERSE_STEPS + 1))
-        if args.all_handover_steps
-        else [args.handover_step]
-    )
-    max_completed_steps = max(selected_steps)
-    init_image = load_init_image(args.init_img, args.image_size).to(
-        device, non_blocking=device.type == "cuda"
-    )
-    output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    save_image(str(output_dir / "input.png"), input_01)
+    save_image(str(output_dir / "adjscc_received.png"), adjscc_01)
 
-    with stable_diffusion.ema_scope():
-        clean_latent = stable_diffusion.get_first_stage_encoding(
-            stable_diffusion.encode_first_stage(init_image)
-        )
-        snr_condition = torch.full(
-            (1, 1),
-            args.snr_db,
-            device=device,
-            dtype=clean_latent.dtype,
-        )
-        degraded_latent = adjscc(clean_latent, snr_condition)
-        adjscc_reconstruction = stable_diffusion.decode_first_stage(
-            degraded_latent
-        )
-
-        with precision_scope(device, args.precision):
-            states = generate_resfusion_states(
-                resfusion,
-                schedule,
-                degraded_latent,
-                max_completed_steps=max_completed_steps,
-            )
-
-        conditioning = stable_diffusion.get_learned_conditioning(
-            [args.prompt] * args.num_samples
-        )
-        unconditional_conditioning = None
-        if args.guidance_scale != 1.0:
-            unconditional_conditioning = (
-                stable_diffusion.get_learned_conditioning(
-                    [args.negative_prompt] * args.num_samples
-                )
-            )
-        sampler = prepare_raw_timestep_sampler(
-            stable_diffusion, args.ddim_eta
-        )
-
-        stage_outputs = []
-        for completed_steps in selected_steps:
-            raw_timestep = int(
-                mapping[completed_steps]["sd_raw_timestep"]
-            )
-            state = states[completed_steps]
-            state_reconstruction = stable_diffusion.decode_first_stage(state)
-            direct_latent = state.repeat(
-                args.num_samples, 1, 1, 1
-            )
-            print(
-                (
-                    "handover k={} directly to SD raw t={} "
-                    "({} Stable Diffusion U-Net calls)"
-                ).format(
-                    completed_steps,
-                    raw_timestep,
-                    raw_timestep + 1,
-                ),
-                flush=True,
-            )
-            with precision_scope(device, args.precision):
-                final_latent = decode_from_raw_timestep(
-                    sampler,
-                    direct_latent,
-                    conditioning,
-                    raw_timestep,
-                    args.guidance_scale,
-                    unconditional_conditioning,
-                )
-                final_images = stable_diffusion.decode_first_stage(
-                    final_latent
-                )
-            stage_outputs.append(
-                {
-                    "completed_steps": completed_steps,
-                    "raw_timestep": raw_timestep,
-                    "state_reconstruction": state_reconstruction,
-                    "final_images": final_images,
-                }
-            )
-
-    input_shape = list(init_image.shape)
-    clean_latent_shape = list(clean_latent.shape)
-    degraded_latent_shape = list(degraded_latent.shape)
-    input_01 = to_display_range(init_image).cpu()
-    adjscc_01 = to_display_range(adjscc_reconstruction).cpu()
-    display_stage_outputs = [
-        {
-            "completed_steps": int(output["completed_steps"]),
-            "raw_timestep": int(output["raw_timestep"]),
-            "state_01": to_display_range(
-                output["state_reconstruction"]
-            ).cpu(),
-            "final_01": to_display_range(output["final_images"]).cpu(),
-        }
-        for output in stage_outputs
-    ]
-
-    # Metric backbones are loaded only after inference. Release the diffusion
-    # models and GPU outputs first so LPIPS/DISTS do not increase peak VRAM.
-    del sampler
-    del stable_diffusion
-    del adjscc
-    del resfusion
-    del schedule
-    del states
-    del stage_outputs
-    del init_image
-    del clean_latent
-    del degraded_latent
-    del adjscc_reconstruction
-    del snr_condition
-    del state
-    del state_reconstruction
-    del direct_latent
-    del final_latent
-    del final_images
-    del conditioning
-    del unconditional_conditioning
-    gc.collect()
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    save_image(str(output_dir / "input.png"), input_01[0])
-    save_image(
-        str(output_dir / "adjscc_received.png"), adjscc_01[0]
+    label_prefix = source_image.name
+    adjscc_metrics = metric_evaluator.evaluate(input_01, adjscc_01)
+    print_metric_record(
+        "{} / ADJSCC received".format(label_prefix), adjscc_metrics
     )
-
-    print("Loading PSNR/LPIPS/DISTS/MS-SSIM evaluators...", flush=True)
-    metric_evaluator = ImageMetricEvaluator(device)
-    adjscc_metrics = metric_evaluator.evaluate(input_01[0], adjscc_01[0])
-    print_metric_record("ADJSCC received", adjscc_metrics)
     metric_results = {
+        "source_image": str(source_image.resolve()),
         "reference": {"label": "ground_truth", "path": "input.png"},
         "definitions": dict(METRIC_DEFINITIONS),
         "adjscc_received": {
@@ -497,7 +471,7 @@ def run_inference(args) -> Dict[str, object]:
     }
 
     output_records: List[Dict[str, object]] = []
-    summary_images = [input_01[0], adjscc_01[0]]
+    summary_images = [input_01, adjscc_01]
     for output in display_stage_outputs:
         completed_steps = int(output["completed_steps"])
         raw_timestep = int(output["raw_timestep"])
@@ -507,10 +481,12 @@ def run_inference(args) -> Dict[str, object]:
         stage_dir = output_dir / stage_name
         state_01 = output["state_01"]
         final_01 = output["final_01"]
-        save_image(str(stage_dir / "resfusion_state.png"), state_01[0])
-        state_metrics = metric_evaluator.evaluate(input_01[0], state_01[0])
+        save_image(str(stage_dir / "resfusion_state.png"), state_01)
+        state_metrics = metric_evaluator.evaluate(input_01, state_01)
         print_metric_record(
-            "handover k={} Resfusion state".format(completed_steps),
+            "{} / handover k={} Resfusion state".format(
+                label_prefix, completed_steps
+            ),
             state_metrics,
         )
         sample_paths = []
@@ -521,10 +497,10 @@ def run_inference(args) -> Dict[str, object]:
             )
             save_image(str(output_dir / relative_path), image)
             sample_paths.append(relative_path)
-            sample_metrics = metric_evaluator.evaluate(input_01[0], image)
+            sample_metrics = metric_evaluator.evaluate(input_01, image)
             print_metric_record(
-                "handover k={} sample {:03d}".format(
-                    completed_steps, index
+                "{} / handover k={} sample {:03d}".format(
+                    label_prefix, completed_steps, index
                 ),
                 sample_metrics,
             )
@@ -534,9 +510,9 @@ def run_inference(args) -> Dict[str, object]:
 
         comparison = torch.cat(
             (
-                input_01.repeat(args.num_samples, 1, 1, 1),
-                adjscc_01.repeat(args.num_samples, 1, 1, 1),
-                state_01.repeat(args.num_samples, 1, 1, 1),
+                input_01.unsqueeze(0).repeat(args.num_samples, 1, 1, 1),
+                adjscc_01.unsqueeze(0).repeat(args.num_samples, 1, 1, 1),
+                state_01.unsqueeze(0).repeat(args.num_samples, 1, 1, 1),
                 final_01,
             ),
             dim=0,
@@ -636,6 +612,7 @@ def run_inference(args) -> Dict[str, object]:
             "SD VAE decoder"
         ),
         "handover": "direct; no bridge, no re-noise, no residual subtraction",
+        "source_image": str(source_image.resolve()),
         "arguments": {
             name: list(value) if isinstance(value, tuple) else value
             for name, value in vars(args).items()
@@ -644,9 +621,9 @@ def run_inference(args) -> Dict[str, object]:
         "sd_checkpoint": str(Path(args.sd_checkpoint).resolve()),
         "adjscc_checkpoint": adjscc_info,
         "resfusion_checkpoint": resfusion_info,
-        "input_shape": input_shape,
-        "clean_latent_shape": clean_latent_shape,
-        "degraded_latent_shape": degraded_latent_shape,
+        "input_shape": [1] + list(input_01.shape),
+        "clean_latent_shape": [1] + list(clean_latent_sample_shape),
+        "degraded_latent_shape": [1] + list(degraded_latent_sample_shape),
         "timestep_mapping": mapping,
         "selected_handover_steps": selected_steps,
         "outputs": {
@@ -658,13 +635,377 @@ def run_inference(args) -> Dict[str, object]:
         },
     }
     save_json(str(output_dir / "metadata.json"), results)
-    print("Saved direct-handover results to {}".format(output_dir.resolve()))
-    return results
+    return results, metric_results
+
+
+@torch.no_grad()
+def run_batched_inference(
+    args,
+    input_source: Path,
+    image_paths: List[Path],
+    directory_input: bool,
+) -> Dict[str, object]:
+    """Batch one or more images while preserving per-image outputs."""
+
+    seed_everything(args.seed)
+    device = resolve_device(args.device)
+    print("device: {}".format(device))
+    if directory_input:
+        print(
+            "Discovered {} input images below {}".format(
+                len(image_paths), input_source
+            ),
+            flush=True,
+        )
+
+    output_root = Path(args.output_dir).resolve()
+    if directory_input:
+        try:
+            output_root.relative_to(input_source)
+        except ValueError:
+            pass
+        else:
+            raise ValueError(
+                "--output-dir must not be inside the input image directory"
+            )
+    output_root.mkdir(parents=True, exist_ok=True)
+    image_output_dirs = image_output_directories(
+        input_source,
+        image_paths,
+        output_root,
+        directory_input=directory_input,
+    )
+    output_dir_by_path = {
+        str(path.resolve()): directory
+        for path, directory in zip(image_paths, image_output_dirs)
+    }
+
+    dataset = FFHQDataset(
+        image_paths, image_size=args.image_size, augment=False
+    )
+    loader = make_loader(
+        dataset,
+        args.batch_size,
+        False,
+        args.num_workers,
+        device,
+    )
+
+    stable_diffusion = load_stable_diffusion(
+        args.sd_config,
+        args.sd_checkpoint,
+        device,
+        verbose=args.verbose_loading,
+    )
+    adjscc, adjscc_info = load_adjscc(
+        args.adjscc_checkpoint,
+        device,
+        args.transmit_channel_num,
+        args.feature_channels,
+    )
+    resfusion, resfusion_payload, resfusion_info = (
+        load_latent_resfusion_checkpoint(
+            args.resfusion_checkpoint,
+            device,
+            fallback_dim=args.model_dim,
+            fallback_dim_mults=args.dim_mults,
+            fallback_resnet_groups=args.resnet_block_groups,
+            freeze=True,
+        )
+    )
+    del resfusion_payload
+    gc.collect()
+
+    schedule = FiveStepResfusionSchedule().to(device)
+    mapping = timestep_mapping_records(
+        schedule, stable_diffusion.alphas_cumprod
+    )
+    print(
+        "Direct handover mapping k=0..5 -> SD raw timestep: {}".format(
+            [record["sd_raw_timestep"] for record in mapping]
+        )
+    )
+    selected_steps = (
+        list(range(RESFUSION_REVERSE_STEPS + 1))
+        if args.all_handover_steps
+        else [args.handover_step]
+    )
+    max_completed_steps = max(selected_steps)
+
+    # Keep perceptual metrics on CPU while the diffusion models remain on GPU
+    # for subsequent input batches.
+    print("Loading PSNR/LPIPS/DISTS/MS-SSIM evaluators...", flush=True)
+    metric_evaluator = ImageMetricEvaluator(torch.device("cpu"))
+    image_metric_results: List[Dict[str, object]] = []
+    image_results: List[Dict[str, object]] = []
+    image_manifest: List[Dict[str, object]] = []
+    processed_images = 0
+
+    with stable_diffusion.ema_scope():
+        sampler = prepare_raw_timestep_sampler(
+            stable_diffusion, args.ddim_eta
+        )
+        for batch_index, batch in enumerate(loader):
+            init_images = batch["image"].to(
+                device, non_blocking=device.type == "cuda"
+            )
+            batch_paths = [Path(path).resolve() for path in batch["path"]]
+            batch_count = init_images.shape[0]
+            print(
+                "Processing batch {}/{} ({} images)".format(
+                    batch_index + 1,
+                    len(loader),
+                    batch_count,
+                ),
+                flush=True,
+            )
+
+            clean_latent = stable_diffusion.get_first_stage_encoding(
+                stable_diffusion.encode_first_stage(init_images)
+            )
+            snr_condition = torch.full(
+                (batch_count, 1),
+                args.snr_db,
+                device=device,
+                dtype=clean_latent.dtype,
+            )
+            degraded_latent = adjscc(clean_latent, snr_condition)
+            adjscc_reconstruction = stable_diffusion.decode_first_stage(
+                degraded_latent
+            )
+            with precision_scope(device, args.precision):
+                states = generate_resfusion_states(
+                    resfusion,
+                    schedule,
+                    degraded_latent,
+                    max_completed_steps=max_completed_steps,
+                )
+
+            sample_batch_count = batch_count * args.num_samples
+            conditioning = stable_diffusion.get_learned_conditioning(
+                [args.prompt] * sample_batch_count
+            )
+            unconditional_conditioning = None
+            if args.guidance_scale != 1.0:
+                unconditional_conditioning = (
+                    stable_diffusion.get_learned_conditioning(
+                        [args.negative_prompt] * sample_batch_count
+                    )
+                )
+
+            display_stage_outputs = []
+            for completed_steps in selected_steps:
+                raw_timestep = int(
+                    mapping[completed_steps]["sd_raw_timestep"]
+                )
+                state = states[completed_steps]
+                state_reconstruction = stable_diffusion.decode_first_stage(
+                    state
+                )
+                direct_latent = repeat_latents_for_samples(
+                    state, args.num_samples
+                )
+                print(
+                    (
+                        "batch {} handover k={} directly to SD raw t={} "
+                        "({} Stable Diffusion U-Net calls)"
+                    ).format(
+                        batch_index + 1,
+                        completed_steps,
+                        raw_timestep,
+                        raw_timestep + 1,
+                    ),
+                    flush=True,
+                )
+                with precision_scope(device, args.precision):
+                    final_latent = decode_from_raw_timestep(
+                        sampler,
+                        direct_latent,
+                        conditioning,
+                        raw_timestep,
+                        args.guidance_scale,
+                        unconditional_conditioning,
+                    )
+                    final_images = stable_diffusion.decode_first_stage(
+                        final_latent
+                    )
+                final_01 = to_display_range(final_images).cpu().reshape(
+                    batch_count,
+                    args.num_samples,
+                    *final_images.shape[1:]
+                )
+                display_stage_outputs.append(
+                    {
+                        "completed_steps": completed_steps,
+                        "raw_timestep": raw_timestep,
+                        "state_01": to_display_range(
+                            state_reconstruction
+                        ).cpu(),
+                        "final_01": final_01,
+                    }
+                )
+
+            input_01 = to_display_range(init_images).cpu()
+            adjscc_01 = to_display_range(adjscc_reconstruction).cpu()
+            clean_latent_sample_shape = list(clean_latent.shape[1:])
+            degraded_latent_sample_shape = list(degraded_latent.shape[1:])
+            for image_index, source_image in enumerate(batch_paths):
+                per_image_stage_outputs = [
+                    {
+                        "completed_steps": output["completed_steps"],
+                        "raw_timestep": output["raw_timestep"],
+                        "state_01": output["state_01"][image_index],
+                        "final_01": output["final_01"][image_index],
+                    }
+                    for output in display_stage_outputs
+                ]
+                image_output_dir = output_dir_by_path[str(source_image)]
+                image_result, metric_result = save_single_image_outputs(
+                    args,
+                    source_image,
+                    image_output_dir,
+                    device,
+                    input_01[image_index],
+                    adjscc_01[image_index],
+                    per_image_stage_outputs,
+                    clean_latent_sample_shape,
+                    degraded_latent_sample_shape,
+                    mapping,
+                    selected_steps,
+                    adjscc_info,
+                    resfusion_info,
+                    metric_evaluator,
+                )
+                image_results.append(image_result)
+                image_metric_results.append(metric_result)
+                relative_output_dir = image_output_dir.relative_to(
+                    output_root
+                )
+                image_manifest.append(
+                    {
+                        "source_image": str(source_image),
+                        "output_directory": relative_output_dir.as_posix(),
+                        "metadata": (
+                            relative_output_dir / "metadata.json"
+                        ).as_posix(),
+                        "metrics": (
+                            relative_output_dir / "metrics.json"
+                        ).as_posix(),
+                    }
+                )
+                processed_images += 1
+                print(
+                    "Saved image {}/{} to {}".format(
+                        processed_images,
+                        len(image_paths),
+                        image_output_dir,
+                    ),
+                    flush=True,
+                )
+
+            del init_images
+            del clean_latent
+            del degraded_latent
+            del adjscc_reconstruction
+            del snr_condition
+            del states
+            del state
+            del state_reconstruction
+            del direct_latent
+            del final_latent
+            del final_images
+            del conditioning
+            del unconditional_conditioning
+            del display_stage_outputs
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    if not directory_input:
+        print(
+            "Saved direct-handover results to {}".format(output_root),
+            flush=True,
+        )
+        return image_results[0]
+
+    aggregate_metrics = aggregate_image_metrics(image_metric_results)
+    aggregate_metrics.update(
+        {
+            "input_directory": str(input_source),
+            "num_samples_per_image": args.num_samples,
+        }
+    )
+    aggregate_metrics_path = output_root / "aggregate_metrics.json"
+    save_json(str(aggregate_metrics_path), aggregate_metrics)
+    print_metric_record(
+        "Dataset / ADJSCC received mean",
+        aggregate_metrics["adjscc_received"]["mean"],
+    )
+    for stage in aggregate_metrics["handover_results"]:
+        print_metric_record(
+            "Dataset / handover k={} Resfusion state mean".format(
+                stage["completed_resfusion_steps"]
+            ),
+            stage["resfusion_state_decode"]["mean"],
+        )
+        print_metric_record(
+            "Dataset / handover k={} sample mean".format(
+                stage["completed_resfusion_steps"]
+            ),
+            stage["stable_diffusion_samples"]["mean"],
+        )
+
+    batch_results = {
+        "input": {
+            "directory": str(input_source),
+            "image_count": len(image_paths),
+            "recursive": True,
+        },
+        "arguments": {
+            name: list(value) if isinstance(value, tuple) else value
+            for name, value in vars(args).items()
+        },
+        "device": str(device),
+        "sd_checkpoint": str(Path(args.sd_checkpoint).resolve()),
+        "adjscc_checkpoint": adjscc_info,
+        "resfusion_checkpoint": resfusion_info,
+        "timestep_mapping": mapping,
+        "selected_handover_steps": selected_steps,
+        "outputs": {
+            "aggregate_metrics": "aggregate_metrics.json",
+            "images": image_manifest,
+        },
+    }
+    save_json(str(output_root / "batch_metadata.json"), batch_results)
+    print(
+        "Saved batch results for {} images to {}".format(
+            len(image_paths), output_root
+        ),
+        flush=True,
+    )
+    return batch_results
+
+
+@torch.no_grad()
+def run_inference(args) -> Dict[str, object]:
+    validate_args(args)
+    validate_metric_dependencies()
+    input_source, image_paths, directory_input = resolve_input_images(
+        args.init_img
+    )
+    return run_batched_inference(
+        args, input_source, image_paths, directory_input
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--init-img", required=True)
+    parser.add_argument(
+        "--init-img",
+        "--input-dir",
+        dest="init_img",
+        required=True,
+        help="input image file or directory (directories are searched recursively)",
+    )
     parser.add_argument("--adjscc-checkpoint", required=True)
     parser.add_argument("--resfusion-checkpoint", required=True)
     parser.add_argument("--sd-config", default=str(DEFAULT_SD_CONFIG))
@@ -686,6 +1027,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ddim-eta", default=0.0, type=float)
     parser.add_argument("--num-samples", default=1, type=int)
+    parser.add_argument("--batch-size", default=1, type=int)
+    parser.add_argument("--num-workers", default=0, type=int)
 
     parser.add_argument("--transmit-channel-num", default=32, type=int)
     parser.add_argument("--feature-channels", default=256, type=int)
