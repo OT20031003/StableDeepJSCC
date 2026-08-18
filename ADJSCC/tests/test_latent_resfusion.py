@@ -12,6 +12,8 @@ sys.path.insert(0, str(PROJECT_DIR))
 sys.path.insert(0, str(REPO_ROOT))
 
 from infer_latent_resfusion_handover import (
+    ImageMetricEvaluator,
+    average_metric_records,
     build_parser as build_inference_parser,
     decode_from_raw_timestep,
     raw_timestep_to_t_start,
@@ -214,6 +216,60 @@ class LatentResfusionModelTests(unittest.TestCase):
 
 
 class DirectHandoverCLITests(unittest.TestCase):
+    def test_image_metrics_compare_displayed_rgb_tensors_to_ground_truth(self):
+        class MeanAbsoluteDifference(torch.nn.Module):
+            def forward(self, image, ground_truth):
+                return (image - ground_truth).abs().mean().reshape(1)
+
+        def fixed_ms_ssim(
+            image, ground_truth, data_range, size_average
+        ):
+            self.assertEqual(data_range, 1.0)
+            self.assertTrue(size_average)
+            self.assertEqual(image.shape, ground_truth.shape)
+            return image.new_tensor([0.75])
+
+        evaluator = ImageMetricEvaluator(
+            torch.device("cpu"),
+            lpips_model=MeanAbsoluteDifference(),
+            dists_model=MeanAbsoluteDifference(),
+            ms_ssim_function=fixed_ms_ssim,
+        )
+        ground_truth = torch.zeros(3, 32, 32)
+        image = torch.full_like(ground_truth, 0.5)
+        metrics = evaluator.evaluate(ground_truth, image)
+
+        self.assertAlmostEqual(metrics["psnr_db"], 6.0205999, places=5)
+        # LPIPS receives [-1, 1] inputs; DISTS receives [0, 1] inputs.
+        self.assertAlmostEqual(metrics["lpips"], 1.0, places=6)
+        self.assertAlmostEqual(metrics["dists"], 0.5, places=6)
+        self.assertAlmostEqual(metrics["ms_ssim"], 0.75, places=6)
+
+    def test_metric_record_average_includes_all_four_metrics(self):
+        averaged = average_metric_records(
+            [
+                {
+                    "psnr_db": 10.0,
+                    "lpips": 0.2,
+                    "dists": 0.4,
+                    "ms_ssim": 0.6,
+                },
+                {
+                    "psnr_db": 20.0,
+                    "lpips": 0.4,
+                    "dists": 0.6,
+                    "ms_ssim": 0.8,
+                },
+            ]
+        )
+        self.assertEqual(set(averaged), {
+            "psnr_db", "lpips", "dists", "ms_ssim"
+        })
+        self.assertAlmostEqual(averaged["psnr_db"], 15.0)
+        self.assertAlmostEqual(averaged["lpips"], 0.3)
+        self.assertAlmostEqual(averaged["dists"], 0.5)
+        self.assertAlmostEqual(averaged["ms_ssim"], 0.7)
+
     def test_raw_timestep_is_inclusive(self):
         self.assertEqual(raw_timestep_to_t_start(0), 1)
         self.assertEqual(raw_timestep_to_t_start(520), 521)

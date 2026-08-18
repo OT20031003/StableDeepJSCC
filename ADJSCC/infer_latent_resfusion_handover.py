@@ -4,10 +4,11 @@ import argparse
 import gc
 import math
 from pathlib import Path
-from typing import Dict, List
+from typing import Callable, Dict, List, Optional
 
 import torch
 from torch import Tensor
+from torch import nn
 from torchvision.utils import make_grid
 
 
@@ -29,7 +30,13 @@ from latent_resfusion import (
     parse_dim_mults,
     timestep_mapping_records,
 )
-from training import resolve_device, save_image, save_json, seed_everything
+from training import (
+    mse_to_psnr,
+    resolve_device,
+    save_image,
+    save_json,
+    seed_everything,
+)
 
 
 DEFAULT_OUTPUT_DIR = (
@@ -37,6 +44,184 @@ DEFAULT_OUTPUT_DIR = (
     / "outputs"
     / "latent_resfusion_direct_handover"
 )
+
+METRIC_DEFINITIONS = {
+    "psnr_db": "PSNR on RGB [0, 1] tensors with data_range=1.0",
+    "lpips": "LPIPS v0.1 with the AlexNet backbone; lower is better",
+    "dists": "DISTS with its learned alpha/beta weights; lower is better",
+    "ms_ssim": (
+        "five-scale MS-SSIM with the standard weights and data_range=1.0; "
+        "higher is better"
+    ),
+}
+
+
+def _metric_dependency_error(package_name: str) -> RuntimeError:
+    return RuntimeError(
+        (
+            "Image metric dependency '{}' is not installed. Update the conda "
+            "environment from environment.yaml before running inference."
+        ).format(package_name)
+    )
+
+
+def _load_lpips_model() -> nn.Module:
+    try:
+        import lpips
+    except ImportError as error:
+        raise _metric_dependency_error("lpips") from error
+    return lpips.LPIPS(net="alex", version="0.1", verbose=False)
+
+
+def _load_dists_model() -> nn.Module:
+    try:
+        import DISTS_pytorch
+        from DISTS_pytorch import DISTS
+    except ImportError as error:
+        raise _metric_dependency_error("DISTS-pytorch") from error
+
+    # DISTS-pytorch 0.1 looks for weights.pt at sys.prefix when constructed
+    # with load_weights=True. Load the package-local copy explicitly so the
+    # metric works in an ordinary conda/pip environment without copying files.
+    model = DISTS(load_weights=False)
+    weights_path = Path(DISTS_pytorch.__file__).resolve().with_name("weights.pt")
+    if not weights_path.is_file():
+        raise FileNotFoundError(
+            "DISTS weights were not found at {}".format(weights_path)
+        )
+    weights = torch.load(str(weights_path), map_location="cpu")
+    with torch.no_grad():
+        model.alpha.copy_(weights["alpha"])
+        model.beta.copy_(weights["beta"])
+    return model
+
+
+def _load_ms_ssim_function() -> Callable[..., Tensor]:
+    try:
+        from pytorch_msssim import ms_ssim
+    except ImportError as error:
+        raise _metric_dependency_error("pytorch-msssim") from error
+    return ms_ssim
+
+
+def validate_metric_dependencies() -> None:
+    """Fail before long diffusion sampling when metric packages are missing."""
+
+    try:
+        import lpips  # noqa: F401
+    except ImportError as error:
+        raise _metric_dependency_error("lpips") from error
+    try:
+        import DISTS_pytorch
+    except ImportError as error:
+        raise _metric_dependency_error("DISTS-pytorch") from error
+    weights_path = Path(DISTS_pytorch.__file__).resolve().with_name("weights.pt")
+    if not weights_path.is_file():
+        raise FileNotFoundError(
+            "DISTS weights were not found at {}".format(weights_path)
+        )
+    _load_ms_ssim_function()
+
+
+class ImageMetricEvaluator:
+    """Evaluate displayed RGB images against one ground-truth image."""
+
+    def __init__(
+        self,
+        device: torch.device,
+        lpips_model: Optional[nn.Module] = None,
+        dists_model: Optional[nn.Module] = None,
+        ms_ssim_function: Optional[Callable[..., Tensor]] = None,
+    ) -> None:
+        self.device = device
+        self.lpips_model = (
+            _load_lpips_model() if lpips_model is None else lpips_model
+        )
+        self.dists_model = (
+            _load_dists_model() if dists_model is None else dists_model
+        )
+        self.ms_ssim_function = (
+            _load_ms_ssim_function()
+            if ms_ssim_function is None
+            else ms_ssim_function
+        )
+        for model in (self.lpips_model, self.dists_model):
+            model.to(device).eval()
+            for parameter in model.parameters():
+                parameter.requires_grad_(False)
+
+    @staticmethod
+    def _as_image_batch(image: Tensor, name: str) -> Tensor:
+        if image.ndim == 3:
+            image = image.unsqueeze(0)
+        if image.ndim != 4 or image.shape[0] != 1 or image.shape[1] != 3:
+            raise ValueError(
+                "{} must have shape [3, H, W] or [1, 3, H, W]".format(name)
+            )
+        if not torch.isfinite(image).all():
+            raise ValueError("{} contains a non-finite value".format(name))
+        return image.detach().float().clamp(0.0, 1.0)
+
+    @torch.no_grad()
+    def evaluate(self, ground_truth: Tensor, image: Tensor) -> Dict[str, float]:
+        ground_truth = self._as_image_batch(
+            ground_truth, "ground_truth"
+        ).to(self.device)
+        image = self._as_image_batch(image, "image").to(self.device)
+        if image.shape != ground_truth.shape:
+            raise ValueError(
+                "image and ground_truth shapes differ: {} != {}".format(
+                    list(image.shape), list(ground_truth.shape)
+                )
+            )
+
+        mse = torch.mean((image - ground_truth) ** 2)
+        psnr_db = mse_to_psnr(float(mse.item()), data_range=1.0)
+
+        lpips_value = self.lpips_model(
+            image * 2.0 - 1.0,
+            ground_truth * 2.0 - 1.0,
+        )
+        dists_value = self.dists_model(image, ground_truth)
+        ms_ssim_value = self.ms_ssim_function(
+            image,
+            ground_truth,
+            data_range=1.0,
+            size_average=True,
+        )
+        return {
+            "psnr_db": psnr_db,
+            "lpips": float(lpips_value.reshape(-1)[0].item()),
+            "dists": float(dists_value.reshape(-1)[0].item()),
+            "ms_ssim": float(ms_ssim_value.reshape(-1)[0].item()),
+        }
+
+
+def average_metric_records(
+    records: List[Dict[str, float]],
+) -> Dict[str, float]:
+    if not records:
+        raise ValueError("cannot average an empty metric record list")
+    return {
+        name: float(sum(record[name] for record in records) / len(records))
+        for name in METRIC_DEFINITIONS
+    }
+
+
+def print_metric_record(label: str, metrics: Dict[str, float]) -> None:
+    print(
+        (
+            "{}: PSNR={:.4f} dB, LPIPS={:.6f}, DISTS={:.6f}, "
+            "MS-SSIM={:.6f}"
+        ).format(
+            label,
+            metrics["psnr_db"],
+            metrics["lpips"],
+            metrics["dists"],
+            metrics["ms_ssim"],
+        ),
+        flush=True,
+    )
 
 
 def raw_timestep_to_t_start(raw_timestep: int, total_timesteps: int = 1000) -> int:
@@ -96,6 +281,10 @@ def decode_from_raw_timestep(
 def validate_args(args) -> None:
     if args.image_size <= 0 or args.image_size % 32:
         raise ValueError("--image-size must be a positive multiple of 32")
+    if args.image_size <= 160:
+        raise ValueError(
+            "--image-size must be greater than 160 for five-scale MS-SSIM"
+        )
     if not math.isfinite(args.snr_db):
         raise ValueError("--snr-db must be finite")
     if args.handover_step < 0 or args.handover_step > RESFUSION_REVERSE_STEPS:
@@ -118,6 +307,7 @@ def validate_args(args) -> None:
 @torch.no_grad()
 def run_inference(args) -> Dict[str, object]:
     validate_args(args)
+    validate_metric_dependencies()
     seed_everything(args.seed)
     device = resolve_device(args.device)
     print("device: {}".format(device))
@@ -245,32 +435,102 @@ def run_inference(args) -> Dict[str, object]:
                 }
             )
 
+    input_shape = list(init_image.shape)
+    clean_latent_shape = list(clean_latent.shape)
+    degraded_latent_shape = list(degraded_latent.shape)
     input_01 = to_display_range(init_image).cpu()
     adjscc_01 = to_display_range(adjscc_reconstruction).cpu()
+    display_stage_outputs = [
+        {
+            "completed_steps": int(output["completed_steps"]),
+            "raw_timestep": int(output["raw_timestep"]),
+            "state_01": to_display_range(
+                output["state_reconstruction"]
+            ).cpu(),
+            "final_01": to_display_range(output["final_images"]).cpu(),
+        }
+        for output in stage_outputs
+    ]
+
+    # Metric backbones are loaded only after inference. Release the diffusion
+    # models and GPU outputs first so LPIPS/DISTS do not increase peak VRAM.
+    del sampler
+    del stable_diffusion
+    del adjscc
+    del resfusion
+    del schedule
+    del states
+    del stage_outputs
+    del init_image
+    del clean_latent
+    del degraded_latent
+    del adjscc_reconstruction
+    del snr_condition
+    del state
+    del state_reconstruction
+    del direct_latent
+    del final_latent
+    del final_images
+    del conditioning
+    del unconditional_conditioning
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
     save_image(str(output_dir / "input.png"), input_01[0])
     save_image(
         str(output_dir / "adjscc_received.png"), adjscc_01[0]
     )
 
+    print("Loading PSNR/LPIPS/DISTS/MS-SSIM evaluators...", flush=True)
+    metric_evaluator = ImageMetricEvaluator(device)
+    adjscc_metrics = metric_evaluator.evaluate(input_01[0], adjscc_01[0])
+    print_metric_record("ADJSCC received", adjscc_metrics)
+    metric_results = {
+        "reference": {"label": "ground_truth", "path": "input.png"},
+        "definitions": dict(METRIC_DEFINITIONS),
+        "adjscc_received": {
+            "path": "adjscc_received.png",
+            "metrics": adjscc_metrics,
+        },
+        "handover_results": [],
+    }
+
     output_records: List[Dict[str, object]] = []
     summary_images = [input_01[0], adjscc_01[0]]
-    for output in stage_outputs:
+    for output in display_stage_outputs:
         completed_steps = int(output["completed_steps"])
         raw_timestep = int(output["raw_timestep"])
         stage_name = "handover_k{}_sd_t{:04d}".format(
             completed_steps, raw_timestep
         )
         stage_dir = output_dir / stage_name
-        state_01 = to_display_range(output["state_reconstruction"]).cpu()
-        final_01 = to_display_range(output["final_images"]).cpu()
+        state_01 = output["state_01"]
+        final_01 = output["final_01"]
         save_image(str(stage_dir / "resfusion_state.png"), state_01[0])
+        state_metrics = metric_evaluator.evaluate(input_01[0], state_01[0])
+        print_metric_record(
+            "handover k={} Resfusion state".format(completed_steps),
+            state_metrics,
+        )
         sample_paths = []
+        sample_metric_records = []
         for index, image in enumerate(final_01):
             relative_path = "{}/sample_{:03d}.png".format(
                 stage_name, index
             )
             save_image(str(output_dir / relative_path), image)
             sample_paths.append(relative_path)
+            sample_metrics = metric_evaluator.evaluate(input_01[0], image)
+            print_metric_record(
+                "handover k={} sample {:03d}".format(
+                    completed_steps, index
+                ),
+                sample_metrics,
+            )
+            sample_metric_records.append(
+                {"path": relative_path, "metrics": sample_metrics}
+            )
 
         comparison = torch.cat(
             (
@@ -285,6 +545,68 @@ def run_inference(args) -> Dict[str, object]:
             str(stage_dir / "comparison_grid.png"),
             make_grid(comparison, nrow=args.num_samples),
         )
+        sample_mean = average_metric_records(
+            [record["metrics"] for record in sample_metric_records]
+        )
+        stage_metrics = {
+            "reference": {
+                "label": "ground_truth",
+                "path": "../input.png",
+            },
+            "definitions": dict(METRIC_DEFINITIONS),
+            "comparison_grid": "comparison_grid.png",
+            "layout": {
+                "columns": args.num_samples,
+                "rows": [
+                    "ground_truth",
+                    "adjscc_received",
+                    "resfusion_state_decode",
+                    "stable_diffusion_samples",
+                ],
+            },
+            "images": {
+                "ground_truth": {
+                    "path": "../input.png",
+                    "repeated_across_columns": True,
+                },
+                "adjscc_received": {
+                    "path": "../adjscc_received.png",
+                    "repeated_across_columns": True,
+                    "metrics": adjscc_metrics,
+                },
+                "resfusion_state_decode": {
+                    "path": "resfusion_state.png",
+                    "repeated_across_columns": True,
+                    "metrics": state_metrics,
+                },
+                "stable_diffusion_samples": [
+                    {
+                        "path": Path(record["path"]).name,
+                        "metrics": record["metrics"],
+                    }
+                    for record in sample_metric_records
+                ],
+                "stable_diffusion_sample_mean": sample_mean,
+            },
+        }
+        stage_metrics_path = "{}/metrics.json".format(stage_name)
+        save_json(str(output_dir / stage_metrics_path), stage_metrics)
+        metric_results["handover_results"].append(
+            {
+                "completed_resfusion_steps": completed_steps,
+                "sd_raw_timestep": raw_timestep,
+                "comparison_grid": (
+                    "{}/comparison_grid.png".format(stage_name)
+                ),
+                "metrics_file": stage_metrics_path,
+                "resfusion_state_decode": {
+                    "path": "{}/resfusion_state.png".format(stage_name),
+                    "metrics": state_metrics,
+                },
+                "samples": sample_metric_records,
+                "sample_mean": sample_mean,
+            }
+        )
         summary_images.append(final_01[0])
         output_records.append(
             {
@@ -298,6 +620,7 @@ def run_inference(args) -> Dict[str, object]:
                 "comparison_grid": (
                     "{}/comparison_grid.png".format(stage_name)
                 ),
+                "metrics": stage_metrics_path,
             }
         )
 
@@ -305,6 +628,7 @@ def run_inference(args) -> Dict[str, object]:
         str(output_dir / "summary_grid.png"),
         make_grid(torch.stack(summary_images), nrow=len(summary_images)),
     )
+    save_json(str(output_dir / "metrics.json"), metric_results)
     results = {
         "pipeline": (
             "image -> scaled SD VAE latent -> ADJSCC -> five-step latent "
@@ -320,15 +644,16 @@ def run_inference(args) -> Dict[str, object]:
         "sd_checkpoint": str(Path(args.sd_checkpoint).resolve()),
         "adjscc_checkpoint": adjscc_info,
         "resfusion_checkpoint": resfusion_info,
-        "input_shape": list(init_image.shape),
-        "clean_latent_shape": list(clean_latent.shape),
-        "degraded_latent_shape": list(degraded_latent.shape),
+        "input_shape": input_shape,
+        "clean_latent_shape": clean_latent_shape,
+        "degraded_latent_shape": degraded_latent_shape,
         "timestep_mapping": mapping,
         "selected_handover_steps": selected_steps,
         "outputs": {
             "input": "input.png",
             "adjscc_received": "adjscc_received.png",
             "summary_grid": "summary_grid.png",
+            "metrics": "metrics.json",
             "handover_results": output_records,
         },
     }

@@ -154,7 +154,7 @@ repository rootで実行する。
 cd /mnt/d/stable-diffusion
 ```
 
-既存の `ldm` conda環境で、公式RDDM U-Netを含むCLIのimportとテストを確認済みである。以下ではshellのactivate状態に依存しない `conda run` を使用する。
+既存の `ldm` conda環境で、公式RDDM U-Netを含むCLIのimportとテストを確認済みである。推論時の画質評価には `lpips==0.1.4`、`DISTS-pytorch==0.1`、`pytorch-msssim==1.0.0` を使用し、いずれも `environment.yaml` に含めている。以下ではshellのactivate状態に依存しない `conda run` を使用する。
 
 ## 5. 学習コマンド
 
@@ -237,7 +237,7 @@ python ADJSCC/infer_latent_resfusion_handover.py \
   --sd-checkpoint models/ldm/stable-diffusion-v1/model.ckpt \
   --output-dir ADJSCC/outputs/resfusion_handover_k3 \
   --image-size 256 \
-  --snr-db 0 \
+  --snr-db -10 \
   --handover-step 5 \
   --prompt "" \
   --guidance-scale 1 \
@@ -273,14 +273,18 @@ python ADJSCC/infer_latent_resfusion_handover.py \
 input.png
 adjscc_received.png
 summary_grid.png
+metrics.json
 metadata.json
 handover_k{K}_sd_t{TAU}/
   resfusion_state.png
   sample_000.png
   comparison_grid.png
+  metrics.json
 ```
 
-`metadata.json` には実行引数、checkpoint情報、実際に計算した6段階のtimestep mapping、選択段階、出力pathを記録する。
+各 `comparison_grid.png` は上からGT、ADJSCC受信画像、Resfusion state decode、Stable Diffusion sampleの順である。同じディレクトリの `metrics.json` にはGT以外の各画像をGTと比較したPSNR、LPIPS、DISTS、MS-SSIMを行・列との対応付きで記録する。複数sampleの場合は各sampleの値と平均値を保存する。出力rootの `metrics.json` は全handover段階の集約である。PSNRとMS-SSIMは表示用RGB `[0,1]`（data range 1）、LPIPSはAlexNet版を使用する。
+
+`metadata.json` には実行引数、checkpoint情報、実際に計算した6段階のtimestep mapping、選択段階、出力path、および各metrics fileへのpathを記録する。
 
 ## 7. 検証
 
@@ -299,7 +303,7 @@ conda run -n ldm python ADJSCC/train_latent_resfusion.py --help
 conda run -n ldm python ADJSCC/infer_latent_resfusion_handover.py --help
 ```
 
-結果はADJSCC全体で30 tests passedである。新規テストでは特に次を確認した。
+結果はADJSCC全体で32 tests passedである。新規テストでは特に次を確認した。
 
 - T=12 LinearPro scheduleが5 stepへ切られること
 - forward stateとresidual-noise targetが `easy.tex` の閉形式に一致すること
@@ -312,5 +316,6 @@ conda run -n ldm python ADJSCC/infer_latent_resfusion_handover.py --help
 - samplerがexact raw scheduleを使用して選択timestepから復元すること
 - synthetic 1 epochでResfusion U-Netだけを更新できること
 - 学習CLIと推論CLIが分離されていること
+- 4画質指標が表示用RGB tensorをGTと比較し、複数sampleの平均にも4指標すべてが含まれること
 
 検証環境ではCUDA deviceを利用できなかったため、実checkpointを使ったGPU学習と全Stable Diffusion推論は実行していない。数式・model forward/backward・checkpoint・CLI・既存ADJSCCとの回帰テストまではCPUで確認済みである。
